@@ -1,204 +1,388 @@
 package instagram
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
-// checkRedirect checks if the URL includes "share" and fetches the actual path
-func checkRedirect(url string) (string, error) {
-	splitUrl := strings.Split(url, "/")
-	if contains(splitUrl, "share") {
-		resp, err := http.Get(url)
+// ===== Public types =====
+
+var (
+	csrfToken     string
+	csrfTokenExp  time.Time
+	csrfTokenLock = &sync.Mutex{}
+	cfg           = Config{Retries: 5, Delay: time.Second}
+)
+
+type InstagramResponse struct {
+	ResultsNumber int      `json:"results_number"`
+	URLList       []string `json:"url_list"`
+	PostInfo      struct {
+		OwnerUsername string `json:"owner_username"`
+		OwnerFullname string `json:"owner_fullname"`
+		IsVerified    bool   `json:"is_verified"`
+		IsPrivate     bool   `json:"is_private"`
+		Likes         int    `json:"likes"`
+		IsAd          bool   `json:"is_ad"`
+		Caption       string `json:"caption"`
+	} `json:"post_info"`
+	MediaDetails []MediaDetail `json:"media_details"`
+}
+
+type MediaDetail struct {
+	Type           string     `json:"type"` // "image" | "video"
+	Dimensions     Dimensions `json:"dimensions"`
+	URL            string     `json:"url"`
+	VideoViewCount *int       `json:"video_view_count,omitempty"`
+	Thumbnail      *string    `json:"thumbnail,omitempty"`
+}
+
+type Dimensions struct {
+	Height int `json:"height"`
+	Width  int `json:"width"`
+}
+
+type Config struct {
+	Retries int
+	Delay   time.Duration // initial delay between retries
+}
+
+// ===== Internal structs (map the GraphQL JSON we need) =====
+
+type graphResponse struct {
+	Data struct {
+		ShortcodeMedia *node `json:"xdt_shortcode_media"`
+	} `json:"data"`
+}
+
+type node struct {
+	Typename             string    `json:"__typename"`
+	Owner                owner     `json:"owner"`
+	EdgeMediaToCaption   edgesText `json:"edge_media_to_caption"`
+	EdgeMediaPreviewLike struct {
+		Count int `json:"count"`
+	} `json:"edge_media_preview_like"`
+	IsAd                  bool       `json:"is_ad"`
+	IsVideo               bool       `json:"is_video"`
+	Dimensions            Dimensions `json:"dimensions"`
+	VideoViewCount        *int       `json:"video_view_count,omitempty"`
+	VideoURL              string     `json:"video_url"`
+	DisplayURL            string     `json:"display_url"`
+	EdgeSidecarToChildren struct {
+		Edges []struct {
+			Node node `json:"node"`
+		} `json:"edges"`
+	} `json:"edge_sidecar_to_children"`
+}
+
+type owner struct {
+	Username   string `json:"username"`
+	FullName   string `json:"full_name"`
+	IsVerified bool   `json:"is_verified"`
+	IsPrivate  bool   `json:"is_private"`
+}
+
+type edgesText struct {
+	Edges []struct {
+		Node struct {
+			Text string `json:"text"`
+		} `json:"node"`
+	} `json:"edges"`
+}
+
+// ===== Public API =====
+
+func GetURL(inputURL string) (InstagramResponse, error) {
+
+	client, err := newHTTPClient()
+	if err != nil {
+		return InstagramResponse{}, err
+	}
+
+	// 1) Resolve share redirects if present
+	finalURL, err := checkRedirect(client, inputURL)
+	if err != nil {
+		return InstagramResponse{}, err
+	}
+
+	// 2) Extract shortcode
+	shortcode, err := getShortcode(finalURL)
+	if err != nil {
+		return InstagramResponse{}, err
+	}
+
+	// 3) Fetch post via GraphQL (with retries/backoff)
+	post, err := instagramRequest(client, shortcode, cfg.Retries, cfg.Delay)
+	if err != nil {
+		return InstagramResponse{}, err
+	}
+
+	// 4) Shape output
+	out, err := createOutputData(post)
+	if err != nil {
+		return InstagramResponse{}, err
+	}
+	return out, nil
+}
+
+// ===== Utilities =====
+
+func newHTTPClient() (*http.Client, error) {
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return nil, err
+	}
+	return &http.Client{
+		Jar:     jar,
+		Timeout: 30 * time.Second,
+	}, nil
+}
+
+func checkRedirect(client *http.Client, u string) (string, error) {
+	// Mimic the TS behavior: if URL contains "share", follow it and return the final URL
+	if strings.Contains(u, "/share/") || strings.Contains(u, "/share") {
+		req, err := http.NewRequest(http.MethodGet, u, nil)
+		if err != nil {
+			return "", err
+		}
+		resp, err := client.Do(req)
 		if err != nil {
 			return "", err
 		}
 		defer resp.Body.Close()
-		return resp.Request.URL.Path, nil
+		// final URL after redirects:
+		return resp.Request.URL.String(), nil
 	}
-	return url, nil
+	return u, nil
 }
 
-func contains(slice []string, item string) bool {
-	for _, s := range slice {
-		if s == item {
-			return true
+func getShortcode(u string) (string, error) {
+	parts := strings.Split(u, "/")
+	tags := map[string]struct{}{"p": {}, "reel": {}, "tv": {}, "reels": {}}
+	for i, p := range parts {
+		if _, ok := tags[p]; ok {
+			if i+1 < len(parts) && parts[i+1] != "" {
+				return parts[i+1], nil
+			}
+			break
 		}
 	}
-	return false
+	return "", errors.New("failed to obtain shortcode")
 }
 
-// formatPostInfo formats the post information from the response data
-func formatPostInfo(requestData XdtShortcodeMedia) (PostInfo, error) {
-	owner := requestData.Owner
-	edgeMediaToCaption := requestData.EdgeMediaToCaption.Edges
-	var caption string
-	if len(edgeMediaToCaption) > 0 {
-		caption = edgeMediaToCaption[0].Node.Text
+func getCSRFToken(client *http.Client) (string, error) {
+	csrfTokenLock.Lock()
+	defer csrfTokenLock.Unlock()
+
+	// If in memory token is valid, return it
+	if csrfToken != "" && time.Now().Before(csrfTokenExp) {
+		return csrfToken, nil
 	}
 
-	return PostInfo{
-		OwnerUsername: owner.Username,
-		OwnerFullname: owner.FullName,
-		IsVerified:    owner.IsVerified,
-		IsPrivate:     owner.IsPrivate,
-		Likes:         requestData.EdgeMediaPreviewLike.Count,
-		IsAd:          requestData.IsAd,
-		Caption:       caption,
-	}, nil
-}
-
-// formatMediaDetails formats media data based on whether it's video or image
-func formatMediaDetails(mediaData XdtShortcodeMedia) (MediaDetails, error) {
-	if mediaData.IsVideo {
-		return MediaDetails{
-			Type:      "video",
-			Url:       formatMediaUrl(mediaData.VideoURL),
-			Thumbnail: formatMediaUrl(mediaData.DisplayURL),
-		}, nil
-	} else {
-		return MediaDetails{
-			Type:      "image",
-			Url:       formatMediaUrl(mediaData.DisplayURL),
-			Thumbnail: formatMediaUrl(mediaData.DisplayURL),
-		}, nil
-	}
-}
-
-// getShortcode extracts the shortcode from the URL
-func getShortcode(urlStr string) (string, error) {
-	u, err := url.Parse(urlStr)
+	req, err := http.NewRequest(http.MethodGet, "https://www.instagram.com/", nil)
 	if err != nil {
 		return "", err
 	}
-	path := strings.Split(u.Path, "/")
-	for i, segment := range path {
-		if contains([]string{"p", "reel", "tv", "reels"}, segment) && i+1 < len(path) {
-			return path[i+1], nil
-		}
-	}
-	return "", errors.New("could not find shortcode in url")
-}
-
-// isSidecar checks if the post is actually a sidecar (carousel post)
-func isSidecar(requestData XdtShortcodeMedia) bool {
-	return requestData.Typename == "XDTGraphSidecar"
-}
-
-// instagramRequest makes an API request to Instagram's GraphQL endpoint
-func instagramRequest(shortcode string) (XdtShortcodeMedia, error) {
-	data := url.Values{}
-	data.Set("variables", fmt.Sprintf(`{"shortcode":"%s","fetch_tagged_user_count":null,"hoisted_comment_id":null,"hoisted_reply_id":null}`, shortcode))
-	data.Set("doc_id", "8845758582119845")
-
-	resp, err := http.PostForm("https://www.instagram.com/graphql/query", data)
+	resp, err := client.Do(req)
 	if err != nil {
-		return XdtShortcodeMedia{}, err
+		return "", err
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	for _, c := range resp.Cookies() {
+		if c.Name == "csrftoken" && c.Value != "" {
+			csrfToken = c.Value
+			csrfTokenExp = time.Now().Add(10 * time.Minute) // cache por 10 minutos
+			return csrfToken, nil
+		}
+	}
+	// Fallback: busca no header
+	if cookies := resp.Header["Set-Cookie"]; len(cookies) > 0 {
+		for _, raw := range cookies {
+			if strings.HasPrefix(raw, "csrftoken=") {
+				semi := strings.Index(raw, ";")
+				val := raw[len("csrftoken="):]
+				if semi >= 0 {
+					val = raw[len("csrftoken="):semi]
+				}
+				if val != "" {
+					csrfToken = val
+					csrfTokenExp = time.Now().Add(10 * time.Minute)
+					return csrfToken, nil
+				}
+			}
+		}
+	}
+	return "", errors.New("CSRF token not found in response headers")
+}
+
+func instagramRequest(client *http.Client, shortcode string, retries int, delay time.Duration) (*node, error) {
+	const baseURL = "https://www.instagram.com/graphql/query"
+	const docID = "9510064595728286"
+
+	// 1) CSRF token
+	token, err := getCSRFToken(client)
 	if err != nil {
-		return XdtShortcodeMedia{}, err
+		return nil, wrapErr("failed to obtain CSRF", err)
 	}
 
-	result := GraphResponse{}
-	if err := json.Unmarshal(body, &result); err != nil {
-		return XdtShortcodeMedia{}, err
+	// 2) Build form body
+	variables := map[string]interface{}{
+		"shortcode":               shortcode,
+		"fetch_tagged_user_count": nil,
+		"hoisted_comment_id":      nil,
+		"hoisted_reply_id":        nil,
+	}
+	varJSON, err := json.Marshal(variables)
+	if err != nil {
+		return nil, err
 	}
 
-	if result.Data == nil || result.Data.XdtShortcodeMedia == nil {
-		return XdtShortcodeMedia{}, fmt.Errorf("failed getting XDT short code: %s", result.Message)
+	form := url.Values{}
+	form.Set("variables", string(varJSON))
+	form.Set("doc_id", docID)
+
+	req, err := http.NewRequest(http.MethodPost, baseURL, bytes.NewBufferString(form.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-CSRFToken", token)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	// Retry on 429 / 403 like TS code
+	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden {
+		if retries > 0 {
+			wait := delay
+			if ra := resp.Header.Get("Retry-After"); ra != "" {
+				if sec, convErr := strconv.Atoi(ra); convErr == nil && sec > 0 {
+					wait = time.Duration(sec) * time.Second
+				}
+			}
+			time.Sleep(wait)
+			// Exponential backoff on the "delay" path
+			return instagramRequest(client, shortcode, retries-1, delay*2)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		return nil, errors.New("failed instagram request after retries: " + string(b))
 	}
 
-	return *result.Data.XdtShortcodeMedia, nil
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, errors.New("failed instagram request: " + resp.Status + " - " + string(b))
+	}
+
+	var gr graphResponse
+	if err := json.NewDecoder(resp.Body).Decode(&gr); err != nil {
+		return nil, err
+	}
+	if gr.Data.ShortcodeMedia == nil {
+		return nil, errors.New("only posts/reels supported, check if your link is valid")
+	}
+	return gr.Data.ShortcodeMedia, nil
 }
 
-// OutputData represents the final structured output
-type OutputData struct {
-	ResultsNumber int            `json:"results_number"`
-	UrlList       []string       `json:"url_list"`
-	PostInfo      PostInfo       `json:"post_info"`
-	MediaDetails  []MediaDetails `json:"media_details"`
-}
+func createOutputData(n *node) (InstagramResponse, error) {
+	if n == nil {
+		return InstagramResponse{}, errors.New("nil post data")
+	}
 
-// createOutputData constructs the final response from Instagram data
-func createOutputData(requestData XdtShortcodeMedia) (OutputData, error) {
-	var urlList []string
-	var mediaDetails []MediaDetails
+	var out InstagramResponse
 
-	isSidecar := isSidecar(requestData)
-	if isSidecar {
-		edges := requestData.EdgeSidecarToChildren.Edges
-		for _, edge := range edges {
-			node := edge.Node
-			media, err := formatMediaDetails(node)
-			if err != nil {
-				return OutputData{}, err
-			}
-			mediaDetails = append(mediaDetails, media)
-			if node.IsVideo {
-				urlList = append(urlList, node.VideoURL)
-			} else {
-				urlList = append(urlList, node.DisplayURL)
-			}
+	// Post info
+	out.PostInfo.OwnerUsername = n.Owner.Username
+	out.PostInfo.OwnerFullname = n.Owner.FullName
+	out.PostInfo.IsVerified = n.Owner.IsVerified
+	out.PostInfo.IsPrivate = n.Owner.IsPrivate
+	out.PostInfo.Likes = n.EdgeMediaPreviewLike.Count
+	out.PostInfo.IsAd = n.IsAd
+	out.PostInfo.Caption = firstCaption(n.EdgeMediaToCaption)
+
+	// Media
+	var urls []string
+	var details []MediaDetail
+
+	if isSidecar(n) {
+		for _, e := range n.EdgeSidecarToChildren.Edges {
+			md := formatMediaDetails(&e.Node)
+			details = append(details, md)
+			urls = append(urls, mediaURL(&e.Node))
 		}
 	} else {
-		media, err := formatMediaDetails(requestData)
-		if err != nil {
-			return OutputData{}, err
-		}
-		mediaDetails = append(mediaDetails, media)
-		if requestData.IsVideo {
-			urlList = append(urlList, requestData.VideoURL)
-		} else {
-			urlList = append(urlList, requestData.DisplayURL)
-		}
+		md := formatMediaDetails(n)
+		details = append(details, md)
+		urls = append(urls, mediaURL(n))
 	}
 
-	postInfo, err := formatPostInfo(requestData)
-	if err != nil {
-		return OutputData{}, err
-	}
-
-	return OutputData{
-		ResultsNumber: len(urlList),
-		UrlList:       urlList,
-		PostInfo:      postInfo,
-		MediaDetails:  mediaDetails,
-	}, nil
+	out.ResultsNumber = len(urls)
+	out.URLList = urls
+	out.MediaDetails = details
+	return out, nil
 }
 
-// GetUrl fetches and processes an Instagram URL to return formatted data
-func GetUrl(urlMedia string) (OutputData, error) {
-	redirectedUrl, err := checkRedirect(urlMedia)
-	if err != nil {
-		return OutputData{}, err
-	}
-
-	shortcode, err := getShortcode(redirectedUrl)
-	if err != nil {
-		return OutputData{}, err
-	}
-
-	instagramData, err := instagramRequest(shortcode)
-	if err != nil {
-		return OutputData{}, err
-	}
-
-	return createOutputData(instagramData)
-}
-
-func formatMediaUrl(mediaUrl string) string {
-	u, err := url.Parse(mediaUrl)
-	if err != nil {
+func firstCaption(et edgesText) string {
+	if len(et.Edges) == 0 {
 		return ""
 	}
-	u.Host = "scontent.cdninstagram.com"
-	return u.String()
+	return et.Edges[0].Node.Text
 }
+
+func isSidecar(n *node) bool {
+	return n.Typename == "XDTGraphSidecar"
+}
+
+func formatMediaDetails(n *node) MediaDetail {
+	if n.IsVideo {
+		thumb := n.DisplayURL
+		return MediaDetail{
+			Type:           "video",
+			Dimensions:     n.Dimensions,
+			URL:            n.VideoURL,
+			VideoViewCount: n.VideoViewCount,
+			Thumbnail:      &thumb,
+		}
+	}
+	return MediaDetail{
+		Type:       "image",
+		Dimensions: n.Dimensions,
+		URL:        n.DisplayURL,
+	}
+}
+
+func mediaURL(n *node) string {
+	if n.IsVideo {
+		return n.VideoURL
+	}
+	return n.DisplayURL
+}
+
+func wrapErr(msg string, err error) error {
+	return errors.New(msg + ": " + err.Error())
+}
+
+/*
+Example usage:
+
+func main() {
+	resp, err := InstagramGetURL("https://www.instagram.com/p/SHORTCODE/", &Config{Retries: 5, Delay: time.Second})
+	if err != nil {
+		log.Fatal(err)
+	}
+	b, _ := json.MarshalIndent(resp, "", "  ")
+	fmt.Println(string(b))
+}
+*/

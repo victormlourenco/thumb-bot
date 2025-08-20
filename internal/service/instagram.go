@@ -2,12 +2,13 @@ package service
 
 import (
 	"fmt"
-	"go.uber.org/zap"
-	tb "gopkg.in/telebot.v3"
 	"net/url"
 	"strings"
 	"thumb-bot/internal/integration/instagram"
 	"thumb-bot/internal/utils"
+
+	"go.uber.org/zap"
+	tb "gopkg.in/telebot.v3"
 )
 
 var instagramHosts = []string{
@@ -36,7 +37,7 @@ func (t *TelegramChannelImpl) processInstagramMedia(c tb.Context) error {
 			}
 
 			t.logger.Info("fetching instagram post", zap.String("instaUrl", instaUrl.String()))
-			response, err := instagram.GetUrl(instaUrl.Path)
+			response, err := instagram.GetURL(instaUrl.Path)
 			if err != nil {
 				t.logger.Error("failed to instagram post", zap.Error(err))
 				return err
@@ -54,9 +55,9 @@ func (t *TelegramChannelImpl) processInstagramMedia(c tb.Context) error {
 				media := response.MediaDetails[0]
 				switch media.Type {
 				case "video":
-					album = append(album, &tb.Video{File: tb.FromURL(media.Url), Caption: caption})
+					album = append(album, &tb.Video{File: tb.FromURL(media.URL), Caption: caption})
 				case "image":
-					album = append(album, &tb.Photo{File: tb.FromURL(media.Url), Caption: caption})
+					album = append(album, &tb.Photo{File: tb.FromURL(media.URL), Caption: caption})
 				}
 
 				if len(album) > 0 {
