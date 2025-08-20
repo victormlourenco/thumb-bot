@@ -49,9 +49,12 @@ func (t *TelegramChannelImpl) processTwitterMedia(c tb.Context) error {
 
 			if len(response.MediaExtended) > 0 {
 				album := tb.Album{}
-				for _, media := range response.MediaExtended {
+				for i, media := range response.MediaExtended {
 					mediaUrl := utils.RemoveQueryParams(media.URL)
-					caption := fmt.Sprintf("%s\n\n%s: %s\n\n💟 %d 🔁 %d", response.TweetURL, response.UserScreenName, response.Text, response.Likes, response.Retweets)
+					caption := ""
+					if i == 0 {
+						caption = fmt.Sprintf("%s\n\n%s: %s\n\n💟 %d 🔁 %d", response.TweetURL, response.UserScreenName, response.Text, response.Likes, response.Retweets)
+					}
 					switch media.Type {
 					case "video":
 						album = append(album, &tb.Video{File: tb.FromURL(mediaUrl), Caption: caption})
