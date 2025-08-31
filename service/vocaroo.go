@@ -6,6 +6,7 @@ import (
 	"thumb-bot/utils"
 
 	"github.com/mymmrac/telego"
+	tu "github.com/mymmrac/telego/telegoutil"
 	"go.uber.org/zap"
 )
 
@@ -46,12 +47,11 @@ func (t *TelegramChannelImpl) processVocarooMedia(update telego.Update) error {
 				return err
 			}
 
-			// Send audio using the bot instance
-			_, err = t.bot.SendAudio(&telego.SendAudioParams{
-				ChatID:           telego.ChatID{ID: update.Message.Chat.ID},
-				Audio:            telego.InputFile{URL: vocUrl.String()},
-				ReplyToMessageID: update.Message.MessageID,
-			})
+			audioMessage := tu.Audio(
+				tu.ID(update.Message.Chat.ID), tu.FileFromURL(vocUrl.String()),
+			).WithReplyToMessageID(update.Message.MessageID)
+			_, err = t.bot.SendAudio(audioMessage)
+
 			if err != nil {
 				t.logger.Error("failed to send audio", zap.Error(err))
 				return err
