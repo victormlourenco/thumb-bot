@@ -28,10 +28,5 @@ func (t *TelegramChannelImpl) ProcessMedia(update telego.Update) error {
 		t.logger.Error(instagramErr.Error())
 		return instagramErr
 	}
-	vocarooErr := t.processVocarooMedia(update)
-	if vocarooErr != nil {
-		t.logger.Error(vocarooErr.Error())
-		return vocarooErr
-	}
 	return nil
 }
