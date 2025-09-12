@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 )
 
 type Response struct {
@@ -129,4 +130,83 @@ func Fetch(status string) (Response, error) {
 	}
 
 	return response, nil
+}
+
+// EstimateFileSize estimates file size in bytes using bitrate and duration
+func EstimateFileSize(bitrate int, duration float64) int64 {
+	// Convert bitrate from bps to bytes per second
+	bytesPerSecond := int64(bitrate) / 8
+	// Calculate total size
+	return int64(duration * float64(bytesPerSecond))
+}
+
+// SelectBestVariant selects the best video variant under the size limit
+func SelectBestVariant(variants []Variant, duration float64, maxSizeBytes int64) (*Variant, bool) {
+	if len(variants) == 0 {
+		return nil, false
+	}
+
+	// Filter variants with bitrate information and estimate their sizes
+	var validVariants []struct {
+		variant *Variant
+		size    int64
+	}
+
+	for i := range variants {
+		if variants[i].Bitrate != nil {
+			size := EstimateFileSize(*variants[i].Bitrate, duration)
+			validVariants = append(validVariants, struct {
+				variant *Variant
+				size    int64
+			}{&variants[i], size})
+		}
+	}
+
+	if len(validVariants) == 0 {
+		return nil, false
+	}
+
+	// Sort by size (ascending) to get the largest variant under the limit
+	sort.Slice(validVariants, func(i, j int) bool {
+		return validVariants[i].size < validVariants[j].size
+	})
+
+	// Find the largest variant under the size limit
+	for i := len(validVariants) - 1; i >= 0; i-- {
+		if validVariants[i].size <= maxSizeBytes {
+			return validVariants[i].variant, true
+		}
+	}
+
+	// No variant fits under the limit
+	return nil, false
+}
+
+// GetBestMediaForTelegram selects the best media item for Telegram based on size constraints
+func GetBestMediaForTelegram(media MediaItem) (string, string, bool) {
+	const maxSizeBytes = 20 * 1024 * 1024 // 20MB
+
+	// For videos, try to find the best variant
+	if media.Type == "video" && len(media.Variants) > 0 {
+		bestVariant, found := SelectBestVariant(media.Variants, media.Duration, maxSizeBytes)
+		if found {
+			return bestVariant.URL, "video", true
+		}
+		// If no variant fits, fall back to thumbnail
+		if media.ThumbnailURL != "" {
+			return media.ThumbnailURL, "photo", true
+		}
+	}
+
+	// For photos or if no variants available, use the original URL
+	if media.Type == "photo" || media.Type == "image" {
+		return media.URL, "photo", true
+	}
+
+	// For videos without variants, use original URL (might exceed size limit)
+	if media.Type == "video" {
+		return media.URL, "video", true
+	}
+
+	return "", "", false
 }

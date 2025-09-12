@@ -87,12 +87,19 @@ func (t *TelegramChannelImpl) processFxtwitterResponse(update telego.Update, res
 	if response.Tweet.Media != nil && len(response.Tweet.Media.All) > 0 {
 		var mediaGroup []telego.InputMedia
 		for i, media := range response.Tweet.Media.All {
-			mediaUrl := utils.RemoveQueryParams(media.URL)
+			// Use the new variant selection logic
+			bestUrl, mediaType, found := fxtwitter.GetBestMediaForTelegram(media)
+			if !found {
+				continue
+			}
+
+			mediaUrl := utils.RemoveQueryParams(bestUrl)
 			caption := ""
 			if i == 0 {
 				caption = fmt.Sprintf("%s\n\n%s: %s\n\n💟 %d 🔁 %d", response.Tweet.URL, response.Tweet.Author.ScreenName, response.Tweet.Text, response.Tweet.Likes, response.Tweet.Retweets)
 			}
-			switch media.Type {
+
+			switch mediaType {
 			case "video":
 				mediaGroup = append(mediaGroup, &telego.InputMediaVideo{
 					Media:     telego.InputFile{URL: mediaUrl},
