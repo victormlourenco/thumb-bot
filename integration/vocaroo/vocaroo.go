@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"thumb-bot/internal/utils"
+	"thumb-bot/utils"
 )
 
 func Fetch(url string) (io.Reader, string, error) {

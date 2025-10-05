@@ -4,11 +4,11 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
-	"thumb-bot/internal/integration/instagram"
-	"thumb-bot/internal/utils"
+	"thumb-bot/integration/instagram"
+	"thumb-bot/utils"
 
+	"github.com/mymmrac/telego"
 	"go.uber.org/zap"
-	tb "gopkg.in/telebot.v3"
 )
 
 var instagramHosts = []string{
@@ -16,8 +16,12 @@ var instagramHosts = []string{
 	"www.instagram.com",
 }
 
-func (t *TelegramChannelImpl) processInstagramMedia(c tb.Context) error {
-	payload := c.Message().Text
+func (t *TelegramChannelImpl) processInstagramMedia(update telego.Update) error {
+	if update.Message == nil || update.Message.Text == "" {
+		return nil
+	}
+
+	payload := update.Message.Text
 	links := utils.ExtractLinks(payload)
 	if len(links) == 0 {
 		return nil
@@ -45,7 +49,7 @@ func (t *TelegramChannelImpl) processInstagramMedia(c tb.Context) error {
 
 			if len(response.MediaDetails) > 0 {
 				formatedUrl := utils.RemoveQueryParams(instaUrl.String())
-				album := tb.Album{}
+				var mediaGroup []telego.InputMedia
 
 				caption := fmt.Sprintf("%s\n\n%s", formatedUrl, response.PostInfo.OwnerUsername)
 				if len(response.PostInfo.Caption) > 0 {
@@ -55,18 +59,30 @@ func (t *TelegramChannelImpl) processInstagramMedia(c tb.Context) error {
 				media := response.MediaDetails[0]
 				switch media.Type {
 				case "video":
-					album = append(album, &tb.Video{File: tb.FromURL(media.URL), Caption: caption})
+					mediaGroup = append(mediaGroup, &telego.InputMediaVideo{
+						Media:     telego.InputFile{URL: media.URL},
+						Caption:   caption,
+						ParseMode: "HTML",
+						Type:      "video",
+					})
 				case "image":
-					album = append(album, &tb.Photo{File: tb.FromURL(media.URL), Caption: caption})
+					mediaGroup = append(mediaGroup, &telego.InputMediaPhoto{
+						Media:     telego.InputFile{URL: media.URL},
+						Caption:   caption,
+						ParseMode: "HTML",
+						Type:      "photo",
+					})
 				}
 
-				if len(album) > 0 {
-					options := &tb.SendOptions{
-						ReplyTo: c.Message(),
-					}
-					err = c.SendAlbum(album, options)
+				if len(mediaGroup) > 0 {
+					// Send media group using the bot instance
+					_, err = t.bot.SendMediaGroup(&telego.SendMediaGroupParams{
+						ChatID:           telego.ChatID{ID: update.Message.Chat.ID},
+						Media:            mediaGroup,
+						ReplyToMessageID: update.Message.MessageID,
+					})
 					if err != nil {
-						t.logger.Error("failed to send album", zap.Error(err))
+						t.logger.Error("failed to send media group", zap.Error(err))
 						return err
 					}
 				}

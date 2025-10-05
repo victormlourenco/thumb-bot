@@ -8,6 +8,9 @@
 *.so
 *.dylib
 
+# Thumb bot binary
+thumb-bot
+
 # Test binary, built with `go test -c`
 *.test
 
@@ -24,3 +27,6 @@ go.work.sum
 # env file
 .env
 .idea/
+.vscode/
+.vercel/
+.DS_Store
