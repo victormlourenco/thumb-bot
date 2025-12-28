@@ -64,19 +64,10 @@ func (t *TelegramChannelImpl) processYouTubeMedia(update telego.Update) error {
 		directLink = utils.RemoveQueryParams(youtubeURL.String())
 	}
 
-	// Create caption with title, author, description, and direct link
+	// Create caption with title, author, and direct link
 	caption := fmt.Sprintf("%s\n\n%s", directLink, response.Title)
 	if response.AuthorName != "" {
 		caption = fmt.Sprintf("%s\n\n%s: %s", directLink, response.AuthorName, response.Title)
-	}
-	if response.Description != "" {
-		// Truncate description if too long (Telegram has a 1024 character limit for captions)
-		description := response.Description
-		maxDescLength := 500 // Leave room for title, author, and link
-		if len(description) > maxDescLength {
-			description = description[:maxDescLength] + "..."
-		}
-		caption = fmt.Sprintf("%s\n\n%s", caption, description)
 	}
 
 	// Send thumbnail as photo with caption

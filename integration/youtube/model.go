@@ -15,5 +15,4 @@ type YouTubeResponse struct {
 	ThumbnailWidth  int    `json:"thumbnail_width"`
 	ThumbnailHeight int    `json:"thumbnail_height"`
 	HTML            string `json:"html"`
-	Description     string `json:"description,omitempty"`
 }
