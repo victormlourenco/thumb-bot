@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -20,7 +21,7 @@ var (
 	csrfToken     string
 	csrfTokenExp  time.Time
 	csrfTokenLock = &sync.Mutex{}
-	cfg           = Config{Retries: 5, Delay: time.Second}
+	cfg           = Config{Retries: 5, Delay: time.Second, MaxDelay: 30 * time.Second}
 )
 
 type InstagramResponse struct {
@@ -52,8 +53,9 @@ type Dimensions struct {
 }
 
 type Config struct {
-	Retries int
-	Delay   time.Duration // initial delay between retries
+	Retries  int
+	Delay    time.Duration // initial delay between retries
+	MaxDelay time.Duration // maximum delay cap for exponential backoff
 }
 
 // ===== Internal structs (map the GraphQL JSON we need) =====
@@ -136,6 +138,53 @@ func GetURL(inputURL string) (InstagramResponse, error) {
 
 // ===== Utilities =====
 
+// setBrowserHeaders adds browser-like headers to mimic a real browser request
+func setBrowserHeaders(req *http.Request) {
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+	req.Header.Set("Sec-Ch-Ua", `"Google Chrome";v="143", "Chromium";v="143", "Not A(Brand";v="24"`)
+	req.Header.Set("Sec-Ch-Ua-Full-Version-List", `"Google Chrome";v="143.0.0.0", "Chromium";v="143.0.0.0", "Not A(Brand";v="24.0.0.0"`)
+	req.Header.Set("Sec-Ch-Ua-Mobile", "?0")
+	req.Header.Set("Sec-Ch-Ua-Model", `""`)
+	req.Header.Set("Sec-Ch-Ua-Platform", `"macOS"`)
+	req.Header.Set("Sec-Ch-Ua-Platform-Version", `"15.0.0"`)
+	req.Header.Set("Sec-Ch-Prefers-Color-Scheme", "dark")
+	req.Header.Set("Sec-Fetch-Dest", "document")
+	req.Header.Set("Sec-Fetch-Mode", "navigate")
+	req.Header.Set("Sec-Fetch-Site", "none")
+	req.Header.Set("Sec-Fetch-User", "?1")
+	req.Header.Set("Upgrade-Insecure-Requests", "1")
+	req.Header.Set("Priority", "u=1, i")
+}
+
+// setGraphQLHeaders adds headers specific to Instagram GraphQL API requests
+func setGraphQLHeaders(req *http.Request, csrfToken string) {
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "https://www.instagram.com")
+	req.Header.Set("Referer", "https://www.instagram.com/")
+	req.Header.Set("X-CSRFToken", csrfToken)
+	req.Header.Set("X-IG-App-ID", "936619743392459")
+	req.Header.Set("X-ASBD-ID", "359341")
+	req.Header.Set("X-IG-WWW-Claim", "0")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	req.Header.Set("Sec-Ch-Ua", `"Google Chrome";v="143", "Chromium";v="143", "Not A(Brand";v="24"`)
+	req.Header.Set("Sec-Ch-Ua-Full-Version-List", `"Google Chrome";v="143.0.0.0", "Chromium";v="143.0.0.0", "Not A(Brand";v="24.0.0.0"`)
+	req.Header.Set("Sec-Ch-Ua-Mobile", "?0")
+	req.Header.Set("Sec-Ch-Ua-Model", `""`)
+	req.Header.Set("Sec-Ch-Ua-Platform", `"macOS"`)
+	req.Header.Set("Sec-Ch-Ua-Platform-Version", `"15.0.0"`)
+	req.Header.Set("Sec-Ch-Prefers-Color-Scheme", "dark")
+	req.Header.Set("Sec-Fetch-Dest", "empty")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.Header.Set("Priority", "u=1, i")
+}
+
 func newHTTPClient() (*http.Client, error) {
 	jar, err := cookiejar.New(nil)
 	if err != nil {
@@ -154,6 +203,7 @@ func checkRedirect(client *http.Client, u string) (string, error) {
 		if err != nil {
 			return "", err
 		}
+		setBrowserHeaders(req)
 		resp, err := client.Do(req)
 		if err != nil {
 			return "", err
@@ -179,6 +229,14 @@ func getShortcode(u string) (string, error) {
 	return "", errors.New("failed to obtain shortcode")
 }
 
+// invalidateCSRFToken clears the cached CSRF token, forcing a refresh on next request
+func invalidateCSRFToken() {
+	csrfTokenLock.Lock()
+	defer csrfTokenLock.Unlock()
+	csrfToken = ""
+	csrfTokenExp = time.Time{}
+}
+
 func getCSRFToken(client *http.Client) (string, error) {
 	csrfTokenLock.Lock()
 	defer csrfTokenLock.Unlock()
@@ -192,6 +250,7 @@ func getCSRFToken(client *http.Client) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	setBrowserHeaders(req)
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
@@ -255,8 +314,7 @@ func instagramRequest(client *http.Client, shortcode string, retries int, delay 
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("X-CSRFToken", token)
+	setGraphQLHeaders(req, token)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -267,15 +325,33 @@ func instagramRequest(client *http.Client, shortcode string, retries int, delay 
 	// Retry on 429 / 403 like TS code
 	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden {
 		if retries > 0 {
+			// Invalidate CSRF token so we get a fresh one on retry
+			invalidateCSRFToken()
+
 			wait := delay
 			if ra := resp.Header.Get("Retry-After"); ra != "" {
 				if sec, convErr := strconv.Atoi(ra); convErr == nil && sec > 0 {
 					wait = time.Duration(sec) * time.Second
 				}
 			}
+
+			// Add jitter (±25% of wait time) to prevent thundering herd
+			jitter := time.Duration(float64(wait) * (0.5 - rand.Float64()) * 0.5)
+			wait += jitter
+
+			// Cap the delay to prevent excessively long waits
+			if wait > cfg.MaxDelay {
+				wait = cfg.MaxDelay
+			}
+
 			time.Sleep(wait)
+
 			// Exponential backoff on the "delay" path
-			return instagramRequest(client, shortcode, retries-1, delay*2)
+			nextDelay := delay * 2
+			if nextDelay > cfg.MaxDelay {
+				nextDelay = cfg.MaxDelay
+			}
+			return instagramRequest(client, shortcode, retries-1, nextDelay)
 		}
 		b, _ := io.ReadAll(resp.Body)
 		return nil, errors.New("failed instagram request after retries: " + string(b))
