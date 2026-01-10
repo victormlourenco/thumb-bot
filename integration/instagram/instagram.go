@@ -323,7 +323,7 @@ func instagramRequest(client *http.Client, shortcode string, retries int, delay 
 	defer resp.Body.Close()
 
 	// Retry on 429 / 403 like TS code
-	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden {
+	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized {
 		if retries > 0 {
 			// Invalidate CSRF token so we get a fresh one on retry
 			invalidateCSRFToken()
