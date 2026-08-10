@@ -14,6 +14,9 @@ import (
 var instagramHosts = []string{
 	"instagram.com",
 	"www.instagram.com",
+	"m.instagram.com",
+	"instagr.am",
+	"www.instagr.am",
 }
 
 func (t *TelegramChannelImpl) processInstagramMedia(update telego.Update) error {
@@ -41,7 +44,7 @@ func (t *TelegramChannelImpl) processInstagramMedia(update telego.Update) error 
 			}
 
 			t.logger.Info("fetching instagram post", zap.String("instaUrl", instaUrl.String()))
-			response, err := instagram.GetURL(instaUrl.Path)
+			response, err := instagram.GetURL(instaUrl.String())
 			if err != nil {
 				t.logger.Error("failed to instagram post", zap.Error(err))
 				return err
