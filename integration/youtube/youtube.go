@@ -99,7 +99,19 @@ func Fetch(youtubeURL string) (YouTubeResponse, error) {
 		return YouTubeResponse{}, fmt.Errorf("failed to decode YouTube response: %w", err)
 	}
 
+	// Prefer a smaller thumbnail (mqdefault = 320x180) instead of hq/maxres.
+	response.ThumbnailURL = smallerThumbnailURL(videoID, response.ThumbnailURL)
+	response.ThumbnailWidth = 320
+	response.ThumbnailHeight = 180
+
 	return response, nil
+}
+
+func smallerThumbnailURL(videoID, fallback string) string {
+	if videoID == "" {
+		return fallback
+	}
+	return fmt.Sprintf("https://i.ytimg.com/vi/%s/mqdefault.jpg", videoID)
 }
 
 // GetDirectLink returns a clean YouTube URL for the video

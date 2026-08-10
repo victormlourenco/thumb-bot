@@ -18,6 +18,30 @@ var youtubeHosts = []string{
 	"www.youtu.be",
 }
 
+func formatYouTubeCaption(response youtube.YouTubeResponse, videoURL string) string {
+	title := escapeText(response.Title)
+	if title == "" {
+		title = videoURL
+	}
+
+	if response.AuthorName == "" {
+		return fmt.Sprintf(`<b><a href="%s">%s</a></b>`, escapeText(videoURL), title)
+	}
+
+	authorURL := response.AuthorURL
+	if authorURL == "" {
+		authorURL = "https://www.youtube.com"
+	}
+
+	return fmt.Sprintf(
+		`<b><a href="%s">%s</a></b>:`+"\n"+`<b><a href="%s">%s</a></b>`,
+		escapeText(authorURL),
+		escapeText(response.AuthorName),
+		escapeText(videoURL),
+		title,
+	)
+}
+
 func (t *TelegramChannelImpl) processYouTubeMedia(update telego.Update) error {
 	if update.Message == nil || update.Message.Text == "" {
 		return nil
@@ -35,7 +59,6 @@ func (t *TelegramChannelImpl) processYouTubeMedia(update telego.Update) error {
 		return err
 	}
 
-	// Check if it's a YouTube URL
 	isYouTube := false
 	for _, host := range youtubeHosts {
 		if youtubeURL.Host == host {
@@ -43,59 +66,56 @@ func (t *TelegramChannelImpl) processYouTubeMedia(update telego.Update) error {
 			break
 		}
 	}
-
 	if !isYouTube {
 		return nil
 	}
 
 	t.logger.Info("fetching YouTube video", zap.String("youtubeURL", youtubeURL.String()))
 
-	// Fetch video information
 	response, err := youtube.Fetch(youtubeURL.String())
 	if err != nil {
 		t.logger.Error("failed to fetch YouTube video", zap.Error(err))
 		return err
 	}
 
-	// Get direct link (normalized YouTube URL)
 	directLink, err := youtube.GetDirectLink(youtubeURL.String())
 	if err != nil {
 		t.logger.Warn("failed to get direct link, using original URL", zap.Error(err))
 		directLink = utils.RemoveQueryParams(youtubeURL.String())
 	}
 
-	// Create caption with title, author, and direct link
-	caption := fmt.Sprintf("%s\n\n%s", directLink, response.Title)
-	if response.AuthorName != "" {
-		caption = fmt.Sprintf("%s\n\n%s: %s", directLink, response.AuthorName, response.Title)
-	}
+	caption := formatYouTubeCaption(response, directLink)
+	keyboard := openYouTubeKeyboard(directLink)
+	chatID := telego.ChatID{ID: update.Message.Chat.ID}
+	replyTo := update.Message.MessageID
 
-	// Send thumbnail as photo with caption
 	if response.ThumbnailURL != "" {
 		_, err := t.bot.SendPhoto(&telego.SendPhotoParams{
-			ChatID:           telego.ChatID{ID: update.Message.Chat.ID},
+			ChatID:           chatID,
 			Photo:            telego.InputFile{URL: response.ThumbnailURL},
 			Caption:          caption,
 			ParseMode:        "HTML",
-			ReplyToMessageID: update.Message.MessageID,
+			ReplyToMessageID: replyTo,
+			ReplyMarkup:      keyboard,
 		})
 		if err != nil {
 			t.logger.Error("failed to send YouTube thumbnail", zap.Error(err))
 			return err
 		}
-	} else {
-		// Fallback: send text message if no thumbnail
-		_, err := t.bot.SendMessage(&telego.SendMessageParams{
-			ChatID:           telego.ChatID{ID: update.Message.Chat.ID},
-			Text:             caption,
-			ParseMode:        "HTML",
-			ReplyToMessageID: update.Message.MessageID,
-		})
-		if err != nil {
-			t.logger.Error("failed to send YouTube message", zap.Error(err))
-			return err
-		}
+		return nil
 	}
 
+	_, err = t.bot.SendMessage(&telego.SendMessageParams{
+		ChatID:                chatID,
+		Text:                  caption,
+		ParseMode:             "HTML",
+		DisableWebPagePreview: true,
+		ReplyToMessageID:      replyTo,
+		ReplyMarkup:           keyboard,
+	})
+	if err != nil {
+		t.logger.Error("failed to send YouTube message", zap.Error(err))
+		return err
+	}
 	return nil
 }

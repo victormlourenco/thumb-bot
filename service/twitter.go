@@ -2,16 +2,21 @@ package service
 
 import (
 	"fmt"
+	"html"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"thumb-bot/integration/fxtwitter"
 	"thumb-bot/integration/vxtwitter"
 	"thumb-bot/utils"
+	"unicode/utf8"
 
 	"github.com/mymmrac/telego"
 	"go.uber.org/zap"
 )
+
+const maxQuotedTextRunes = 248
 
 var twitterHosts = []string{
 	"twitter.com",
@@ -83,58 +88,294 @@ func expandShortURL(shortURL string) (string, error) {
 	return resp.Header.Get("Location"), nil
 }
 
-func (t *TelegramChannelImpl) processFxtwitterResponse(update telego.Update, response fxtwitter.Response) error {
-	if response.Tweet.Media != nil && len(response.Tweet.Media.All) > 0 {
-		var mediaGroup []telego.InputMedia
-		for i, media := range response.Tweet.Media.All {
-			// Use the new variant selection logic
-			bestUrl, mediaType, found := fxtwitter.GetBestMediaForTelegram(media)
-			if !found {
-				continue
-			}
+func escapeText(text string) string {
+	return html.EscapeString(html.UnescapeString(text))
+}
 
-			mediaUrl := utils.RemoveQueryParams(bestUrl)
-			caption := ""
-			if i == 0 {
-				caption = fmt.Sprintf("%s\n\n%s: %s\n\n💟 %d 🔁 %d", response.Tweet.URL, response.Tweet.Author.ScreenName, response.Tweet.Text, response.Tweet.Likes, response.Tweet.Retweets)
-			}
+func truncateQuotedText(text string) string {
+	if utf8.RuneCountInString(text) <= maxQuotedTextRunes {
+		return text
+	}
+	runes := []rune(text)
+	return string(runes[:maxQuotedTextRunes]) + "\n..."
+}
 
-			switch mediaType {
-			case "video":
-				mediaGroup = append(mediaGroup, &telego.InputMediaVideo{
-					Media:     telego.InputFile{URL: mediaUrl},
-					Caption:   caption,
-					ParseMode: "HTML",
-					Type:      "video",
-				})
-			case "photo":
-				mediaGroup = append(mediaGroup, &telego.InputMediaPhoto{
-					Media:     telego.InputFile{URL: mediaUrl},
-					Caption:   caption,
-					ParseMode: "HTML",
-					Type:      "photo",
-				})
-			}
+func formatAuthorHeader(name, screenName string) string {
+	return fmt.Sprintf(
+		`<b><a href="https://x.com/%s">%s</a> (<code>@%s</code>)</b>`,
+		screenName,
+		escapeText(name),
+		escapeText(screenName),
+	)
+}
+
+func writeFxTweetHeaderAndText(sb *strings.Builder, tweet fxtwitter.Tweet) {
+	header := formatAuthorHeader(tweet.Author.Name, tweet.Author.ScreenName)
+	text := escapeText(tweet.Text)
+	sb.WriteString("<p><sub>")
+	sb.WriteString(header)
+	if text != "" {
+		sb.WriteString("<br/>")
+		sb.WriteString(strings.ReplaceAll(text, "\n", "<br/>"))
+	}
+	sb.WriteString("</sub></p>\n")
+}
+
+func formatFxTweetCaption(tweet fxtwitter.Tweet) string {
+	var caption strings.Builder
+
+	fmt.Fprintf(&caption, "%s:\n%s",
+		formatAuthorHeader(tweet.Author.Name, tweet.Author.ScreenName),
+		escapeText(tweet.Text),
+	)
+
+	if tweet.Quote != nil {
+		quotedText := truncateQuotedText(tweet.Quote.Text)
+		fmt.Fprintf(&caption, "\n<blockquote><i>Quoting</i> %s:\n%s</blockquote>",
+			formatAuthorHeader(tweet.Quote.Author.Name, tweet.Quote.Author.ScreenName),
+			escapeText(quotedText),
+		)
+	}
+
+	return caption.String()
+}
+
+func formatVxTweetCaption(response vxtwitter.Response) string {
+	return fmt.Sprintf("%s:\n%s",
+		formatAuthorHeader(response.UserName, response.UserScreenName),
+		escapeText(response.Text),
+	)
+}
+
+type resolvedMedia struct {
+	URL  string
+	Type string // photo | video
+}
+
+func resolveFxMediaItems(items []fxtwitter.MediaItem) []resolvedMedia {
+	var resolved []resolvedMedia
+	for _, media := range items {
+		bestURL, mediaType, found := fxtwitter.GetBestMediaForTelegram(media)
+		if !found {
+			continue
 		}
+		resolved = append(resolved, resolvedMedia{
+			URL:  utils.RemoveQueryParams(bestURL),
+			Type: mediaType,
+		})
+	}
+	return resolved
+}
 
-		if len(mediaGroup) > 0 {
-			_, err := t.bot.SendMediaGroup(&telego.SendMediaGroupParams{
-				ChatID:           telego.ChatID{ID: update.Message.Chat.ID},
-				Media:            mediaGroup,
-				ReplyToMessageID: update.Message.MessageID,
+func appendRichMedia(sb *strings.Builder, medias []resolvedMedia, startID int) []richMessageMedia {
+	mediaList := make([]richMessageMedia, 0, len(medias))
+	if len(medias) == 0 {
+		return mediaList
+	}
+
+	// Gallery tweets (2+ items) use <tg-collage> per Bot API rich HTML examples.
+	useCollage := len(medias) > 1
+	if useCollage {
+		sb.WriteString("<tg-collage>")
+	}
+
+	for i, media := range medias {
+		id := strconv.Itoa(startID + i)
+		switch media.Type {
+		case "video":
+			sb.WriteString(fmt.Sprintf(`<video src="tg://video?id=%s"></video>`, id))
+			mediaList = append(mediaList, richMessageMedia{
+				ID: id,
+				Media: map[string]any{
+					"type":  "video",
+					"media": media.URL,
+				},
 			})
-			if err != nil {
-				t.logger.Error("failed to send media group", zap.Error(err))
-				return err
-			}
+		default:
+			sb.WriteString(fmt.Sprintf(`<img src="tg://photo?id=%s"/>`, id))
+			mediaList = append(mediaList, richMessageMedia{
+				ID: id,
+				Media: map[string]any{
+					"type":  "photo",
+					"media": media.URL,
+				},
+			})
 		}
-	} else if response.Tweet.Text != "" {
-		message := fmt.Sprintf("%s\n\n%s: %s", response.Tweet.URL, response.Tweet.Author.ScreenName, response.Tweet.Text)
+	}
+
+	if useCollage {
+		sb.WriteString("</tg-collage>\n")
+	} else {
+		sb.WriteString("\n")
+	}
+	return mediaList
+}
+
+func buildFxQuoteArticle(tweet fxtwitter.Tweet, mainMedias, quoteMedias []resolvedMedia) (string, []richMessageMedia) {
+	var htmlBuilder strings.Builder
+	var mediaList []richMessageMedia
+	quoteMediaPromoted := len(mainMedias) == 0 && len(quoteMedias) > 0
+
+	writeFxTweetHeaderAndText(&htmlBuilder, tweet)
+
+	if !quoteMediaPromoted && len(mainMedias) > 0 {
+		mediaList = append(mediaList, appendRichMedia(&htmlBuilder, mainMedias, 1)...)
+	}
+
+	// Block quotation per Bot API: <blockquote>…<cite>Author</cite></blockquote>
+	htmlBuilder.WriteString("<blockquote>\n")
+	writeFxTweetHeaderAndText(&htmlBuilder, *tweet.Quote)
+
+	if quoteMediaPromoted {
+		mediaList = append(mediaList, appendRichMedia(&htmlBuilder, quoteMedias, 1)...)
+	} else if len(quoteMedias) > 0 {
+		mediaList = append(mediaList, appendRichMedia(&htmlBuilder, quoteMedias, len(mediaList)+1)...)
+	}
+
+	fmt.Fprintf(&htmlBuilder, "<cite>%s</cite>\n", escapeText(tweet.Quote.Author.Name))
+	htmlBuilder.WriteString("</blockquote>\n")
+	return htmlBuilder.String(), mediaList
+}
+
+func buildFxMediaArticle(tweet fxtwitter.Tweet, medias []resolvedMedia) (string, []richMessageMedia) {
+	var htmlBuilder strings.Builder
+	writeFxTweetHeaderAndText(&htmlBuilder, tweet)
+	mediaList := appendRichMedia(&htmlBuilder, medias, 1)
+	return htmlBuilder.String(), mediaList
+}
+
+func buildFxMediaGroup(items []resolvedMedia, caption string) []telego.InputMedia {
+	var mediaGroup []telego.InputMedia
+	for i, media := range items {
+		itemCaption := ""
+		if i == 0 {
+			itemCaption = caption
+		}
+
+		switch media.Type {
+		case "video":
+			mediaGroup = append(mediaGroup, &telego.InputMediaVideo{
+				Media:     telego.InputFile{URL: media.URL},
+				Caption:   itemCaption,
+				ParseMode: "HTML",
+				Type:      "video",
+			})
+		case "photo":
+			mediaGroup = append(mediaGroup, &telego.InputMediaPhoto{
+				Media:     telego.InputFile{URL: media.URL},
+				Caption:   itemCaption,
+				ParseMode: "HTML",
+				Type:      "photo",
+			})
+		}
+	}
+	return mediaGroup
+}
+
+func (t *TelegramChannelImpl) sendTwitterMediaWithButton(update telego.Update, medias []resolvedMedia, caption, tweetURL string) error {
+	keyboard := openTwitterKeyboard(tweetURL)
+	chatID := telego.ChatID{ID: update.Message.Chat.ID}
+	replyTo := update.Message.MessageID
+
+	if len(medias) == 1 {
+		media := medias[0]
+		switch media.Type {
+		case "video":
+			_, err := t.bot.SendVideo(&telego.SendVideoParams{
+				ChatID:           chatID,
+				Video:            telego.InputFile{URL: media.URL},
+				Caption:          caption,
+				ParseMode:        "HTML",
+				ReplyToMessageID: replyTo,
+				ReplyMarkup:      keyboard,
+			})
+			return err
+		default:
+			_, err := t.bot.SendPhoto(&telego.SendPhotoParams{
+				ChatID:           chatID,
+				Photo:            telego.InputFile{URL: media.URL},
+				Caption:          caption,
+				ParseMode:        "HTML",
+				ReplyToMessageID: replyTo,
+				ReplyMarkup:      keyboard,
+			})
+			return err
+		}
+	}
+
+	// Albums can't carry inline keyboards — send as one media group only.
+	mediaGroup := buildFxMediaGroup(medias, caption)
+	if len(mediaGroup) == 0 {
+		return nil
+	}
+	_, err := t.bot.SendMediaGroup(&telego.SendMediaGroupParams{
+		ChatID:           chatID,
+		Media:            mediaGroup,
+		ReplyToMessageID: replyTo,
+	})
+	return err
+}
+
+func (t *TelegramChannelImpl) processFxtwitterResponse(update telego.Update, response fxtwitter.Response) error {
+	tweetURL := response.Tweet.URL
+	if tweetURL == "" {
+		tweetURL = fmt.Sprintf("https://x.com/%s/status/%s", response.Tweet.Author.ScreenName, response.Tweet.ID)
+	}
+	keyboard := openTwitterKeyboard(tweetURL)
+
+	var mainMedias []resolvedMedia
+	if response.Tweet.Media != nil {
+		mainMedias = resolveFxMediaItems(response.Tweet.Media.All)
+	}
+
+	var quoteMedias []resolvedMedia
+	if response.Tweet.Quote != nil && response.Tweet.Quote.Media != nil {
+		quoteMedias = resolveFxMediaItems(response.Tweet.Quote.Media.All)
+	}
+
+	// Quotes with media use sendRichMessage so quoted media renders inside the blockquote.
+	if response.Tweet.Quote != nil && (len(mainMedias) > 0 || len(quoteMedias) > 0) {
+		htmlBody, richMedia := buildFxQuoteArticle(response.Tweet, mainMedias, quoteMedias)
+		err := t.sendRichMessage(update.Message.Chat.ID, update.Message.MessageID, htmlBody, richMedia, keyboard)
+		if err == nil {
+			return nil
+		}
+		t.logger.Warn("sendRichMessage failed, falling back", zap.Error(err))
+	}
+
+	medias := mainMedias
+	if len(medias) == 0 {
+		medias = quoteMedias
+	}
+
+	// Multi-media galleries use one rich message (tg-collage + button).
+	if len(medias) > 1 && response.Tweet.Quote == nil {
+		htmlBody, richMedia := buildFxMediaArticle(response.Tweet, medias)
+		err := t.sendRichMessage(update.Message.Chat.ID, update.Message.MessageID, htmlBody, richMedia, keyboard)
+		if err == nil {
+			return nil
+		}
+		t.logger.Warn("sendRichMessage failed for media album, falling back", zap.Error(err))
+	}
+
+	caption := formatFxTweetCaption(response.Tweet)
+
+	if len(medias) > 0 {
+		if err := t.sendTwitterMediaWithButton(update, medias, caption, tweetURL); err != nil {
+			t.logger.Error("failed to send twitter media", zap.Error(err))
+			return err
+		}
+		return nil
+	}
+
+	if response.Tweet.Text != "" {
 		_, err := t.bot.SendMessage(&telego.SendMessageParams{
-			ChatID:           telego.ChatID{ID: update.Message.Chat.ID},
-			Text:             message,
-			ParseMode:        "HTML",
-			ReplyToMessageID: update.Message.MessageID,
+			ChatID:                telego.ChatID{ID: update.Message.Chat.ID},
+			Text:                  caption,
+			ParseMode:             "HTML",
+			DisableWebPagePreview: true,
+			ReplyToMessageID:      update.Message.MessageID,
+			ReplyMarkup:           keyboard,
 		})
 		if err != nil {
 			t.logger.Error("failed to send message", zap.Error(err))
@@ -145,50 +386,60 @@ func (t *TelegramChannelImpl) processFxtwitterResponse(update telego.Update, res
 }
 
 func (t *TelegramChannelImpl) processVxtwitterResponse(update telego.Update, response vxtwitter.Response) error {
-	if len(response.MediaExtended) > 0 {
-		var mediaGroup []telego.InputMedia
-		for i, media := range response.MediaExtended {
-			mediaUrl := utils.RemoveQueryParams(media.URL)
-			caption := ""
-			if i == 0 {
-				caption = fmt.Sprintf("%s\n\n%s: %s\n\n💟 %d 🔁 %d", response.TweetURL, response.UserScreenName, response.Text, response.Likes, response.Retweets)
-			}
-			switch media.Type {
-			case "video":
-				mediaGroup = append(mediaGroup, &telego.InputMediaVideo{
-					Media:     telego.InputFile{URL: mediaUrl},
-					Caption:   caption,
-					ParseMode: "HTML",
-					Type:      "video",
-				})
-			case "image":
-				mediaGroup = append(mediaGroup, &telego.InputMediaPhoto{
-					Media:     telego.InputFile{URL: mediaUrl},
-					Caption:   caption,
-					ParseMode: "HTML",
-					Type:      "photo",
-				})
-			}
-		}
+	tweetURL := response.TweetURL
+	if tweetURL == "" {
+		tweetURL = fmt.Sprintf("https://x.com/%s/status/%s", response.UserScreenName, response.TweetID)
+	}
+	caption := formatVxTweetCaption(response)
+	keyboard := openTwitterKeyboard(tweetURL)
 
-		if len(mediaGroup) > 0 {
-			_, err := t.bot.SendMediaGroup(&telego.SendMediaGroupParams{
-				ChatID:           telego.ChatID{ID: update.Message.Chat.ID},
-				Media:            mediaGroup,
-				ReplyToMessageID: update.Message.MessageID,
-			})
-			if err != nil {
-				t.logger.Error("failed to send media group", zap.Error(err))
-				return err
-			}
+	var medias []resolvedMedia
+	for _, media := range response.MediaExtended {
+		mediaType := "photo"
+		if media.Type == "video" {
+			mediaType = "video"
 		}
-	} else if response.Text != "" {
-		message := fmt.Sprintf("%s\n\n%s: %s", response.TweetURL, response.UserScreenName, response.Text)
+		medias = append(medias, resolvedMedia{
+			URL:  utils.RemoveQueryParams(media.URL),
+			Type: mediaType,
+		})
+	}
+
+	// Multi-media galleries use one rich message; normal posts use regular sends.
+	if len(medias) > 1 {
+		var htmlBuilder strings.Builder
+		htmlBuilder.WriteString("<p><sub>")
+		htmlBuilder.WriteString(formatAuthorHeader(response.UserName, response.UserScreenName))
+		if response.Text != "" {
+			htmlBuilder.WriteString("<br/>")
+			htmlBuilder.WriteString(strings.ReplaceAll(escapeText(response.Text), "\n", "<br/>"))
+		}
+		htmlBuilder.WriteString("</sub></p>\n")
+		richMedia := appendRichMedia(&htmlBuilder, medias, 1)
+
+		err := t.sendRichMessage(update.Message.Chat.ID, update.Message.MessageID, htmlBuilder.String(), richMedia, keyboard)
+		if err == nil {
+			return nil
+		}
+		t.logger.Warn("sendRichMessage failed for vxtwitter album, falling back", zap.Error(err))
+	}
+
+	if len(medias) > 0 {
+		if err := t.sendTwitterMediaWithButton(update, medias, caption, tweetURL); err != nil {
+			t.logger.Error("failed to send media group", zap.Error(err))
+			return err
+		}
+		return nil
+	}
+
+	if response.Text != "" {
 		_, err := t.bot.SendMessage(&telego.SendMessageParams{
-			ChatID:           telego.ChatID{ID: update.Message.Chat.ID},
-			Text:             message,
-			ParseMode:        "HTML",
-			ReplyToMessageID: update.Message.MessageID,
+			ChatID:                telego.ChatID{ID: update.Message.Chat.ID},
+			Text:                  caption,
+			ParseMode:             "HTML",
+			DisableWebPagePreview: true,
+			ReplyToMessageID:      update.Message.MessageID,
+			ReplyMarkup:           keyboard,
 		})
 		if err != nil {
 			t.logger.Error("failed to send message", zap.Error(err))

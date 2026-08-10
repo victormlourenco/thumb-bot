@@ -74,19 +74,19 @@ type webInfo struct {
 }
 
 type mediaItem struct {
-	Code             string         `json:"code"`
-	MediaType        int            `json:"media_type"` // 1=image, 2=video, 8=sidecar
-	OriginalWidth    int            `json:"original_width"`
-	OriginalHeight   int            `json:"original_height"`
-	LikeCount        int            `json:"like_count"`
-	ViewCount        *int           `json:"view_count"`
-	PlayCount        *int           `json:"play_count"`
-	IsPaidPartnership bool          `json:"is_paid_partnership"`
-	User             mediaUser      `json:"user"`
-	Caption          *mediaCaption  `json:"caption"`
-	ImageVersions2   *imageVersions `json:"image_versions2"`
-	VideoVersions    []mediaVersion `json:"video_versions"`
-	CarouselMedia    []mediaItem    `json:"carousel_media"`
+	Code              string         `json:"code"`
+	MediaType         int            `json:"media_type"` // 1=image, 2=video, 8=sidecar
+	OriginalWidth     int            `json:"original_width"`
+	OriginalHeight    int            `json:"original_height"`
+	LikeCount         int            `json:"like_count"`
+	ViewCount         *int           `json:"view_count"`
+	PlayCount         *int           `json:"play_count"`
+	IsPaidPartnership bool           `json:"is_paid_partnership"`
+	User              mediaUser      `json:"user"`
+	Caption           *mediaCaption  `json:"caption"`
+	ImageVersions2    *imageVersions `json:"image_versions2"`
+	VideoVersions     []mediaVersion `json:"video_versions"`
+	CarouselMedia     []mediaItem    `json:"carousel_media"`
 }
 
 type mediaUser struct {
