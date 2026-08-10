@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,8 +21,10 @@ import (
 var (
 	csrfToken     string
 	csrfTokenExp  time.Time
+	lsdToken      string
 	csrfTokenLock = &sync.Mutex{}
 	cfg           = Config{Retries: 5, Delay: time.Second, MaxDelay: 30 * time.Second}
+	lsdPattern    = regexp.MustCompile(`"LSD",\[\],\{"token":"([^"]+)"\}`)
 )
 
 type InstagramResponse struct {
@@ -58,60 +61,72 @@ type Config struct {
 	MaxDelay time.Duration // maximum delay cap for exponential backoff
 }
 
-// ===== Internal structs (map the GraphQL JSON we need) =====
+// ===== Internal structs (Polaris / v1 web_info media) =====
 
 type graphResponse struct {
 	Data struct {
-		ShortcodeMedia *node `json:"xdt_shortcode_media"`
+		WebInfo *webInfo `json:"xdt_api__v1__media__shortcode__web_info"`
 	} `json:"data"`
 }
 
-type node struct {
-	Typename             string    `json:"__typename"`
-	Owner                owner     `json:"owner"`
-	EdgeMediaToCaption   edgesText `json:"edge_media_to_caption"`
-	EdgeMediaPreviewLike struct {
-		Count int `json:"count"`
-	} `json:"edge_media_preview_like"`
-	IsAd                  bool       `json:"is_ad"`
-	IsVideo               bool       `json:"is_video"`
-	Dimensions            Dimensions `json:"dimensions"`
-	VideoViewCount        *int       `json:"video_view_count,omitempty"`
-	VideoURL              string     `json:"video_url"`
-	DisplayURL            string     `json:"display_url"`
-	EdgeSidecarToChildren struct {
-		Edges []struct {
-			Node node `json:"node"`
-		} `json:"edges"`
-	} `json:"edge_sidecar_to_children"`
+type webInfo struct {
+	Items []mediaItem `json:"items"`
 }
 
-type owner struct {
+type mediaItem struct {
+	Code             string         `json:"code"`
+	MediaType        int            `json:"media_type"` // 1=image, 2=video, 8=sidecar
+	OriginalWidth    int            `json:"original_width"`
+	OriginalHeight   int            `json:"original_height"`
+	LikeCount        int            `json:"like_count"`
+	ViewCount        *int           `json:"view_count"`
+	PlayCount        *int           `json:"play_count"`
+	IsPaidPartnership bool          `json:"is_paid_partnership"`
+	User             mediaUser      `json:"user"`
+	Caption          *mediaCaption  `json:"caption"`
+	ImageVersions2   *imageVersions `json:"image_versions2"`
+	VideoVersions    []mediaVersion `json:"video_versions"`
+	CarouselMedia    []mediaItem    `json:"carousel_media"`
+}
+
+type mediaUser struct {
 	Username   string `json:"username"`
 	FullName   string `json:"full_name"`
 	IsVerified bool   `json:"is_verified"`
 	IsPrivate  bool   `json:"is_private"`
 }
 
-type edgesText struct {
-	Edges []struct {
-		Node struct {
-			Text string `json:"text"`
-		} `json:"node"`
-	} `json:"edges"`
+type mediaCaption struct {
+	Text string `json:"text"`
+}
+
+type imageVersions struct {
+	Candidates []mediaVersion `json:"candidates"`
+}
+
+type mediaVersion struct {
+	URL    string `json:"url"`
+	Width  int    `json:"width"`
+	Height int    `json:"height"`
+}
+
+type sessionTokens struct {
+	csrf string
+	lsd  string
 }
 
 // ===== Public API =====
 
 func GetURL(inputURL string) (InstagramResponse, error) {
-
 	client, err := newHTTPClient()
 	if err != nil {
 		return InstagramResponse{}, err
 	}
 
+	absoluteURL := normalizeInputURL(inputURL)
+
 	// 1) Resolve share redirects if present
-	finalURL, err := checkRedirect(client, inputURL)
+	finalURL, err := checkRedirect(client, absoluteURL)
 	if err != nil {
 		return InstagramResponse{}, err
 	}
@@ -138,51 +153,55 @@ func GetURL(inputURL string) (InstagramResponse, error) {
 
 // ===== Utilities =====
 
-// setBrowserHeaders adds browser-like headers to mimic a real browser request
+func normalizeInputURL(input string) string {
+	input = strings.TrimSpace(input)
+	if strings.HasPrefix(input, "http://") || strings.HasPrefix(input, "https://") {
+		return input
+	}
+	if strings.HasPrefix(input, "/") {
+		return "https://www.instagram.com" + input
+	}
+	return "https://www.instagram.com/" + input
+}
+
+// setBrowserHeaders adds browser-like headers to mimic a real browser request.
+// Do not set Accept-Encoding: Go's transport auto-decompresses when it is unset.
 func setBrowserHeaders(req *http.Request) {
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36")
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
 	req.Header.Set("Sec-Ch-Ua", `"Google Chrome";v="143", "Chromium";v="143", "Not A(Brand";v="24"`)
-	req.Header.Set("Sec-Ch-Ua-Full-Version-List", `"Google Chrome";v="143.0.0.0", "Chromium";v="143.0.0.0", "Not A(Brand";v="24.0.0.0"`)
 	req.Header.Set("Sec-Ch-Ua-Mobile", "?0")
-	req.Header.Set("Sec-Ch-Ua-Model", `""`)
 	req.Header.Set("Sec-Ch-Ua-Platform", `"macOS"`)
-	req.Header.Set("Sec-Ch-Ua-Platform-Version", `"15.0.0"`)
-	req.Header.Set("Sec-Ch-Prefers-Color-Scheme", "dark")
 	req.Header.Set("Sec-Fetch-Dest", "document")
 	req.Header.Set("Sec-Fetch-Mode", "navigate")
 	req.Header.Set("Sec-Fetch-Site", "none")
 	req.Header.Set("Sec-Fetch-User", "?1")
 	req.Header.Set("Upgrade-Insecure-Requests", "1")
-	req.Header.Set("Priority", "u=1, i")
 }
 
 // setGraphQLHeaders adds headers specific to Instagram GraphQL API requests
-func setGraphQLHeaders(req *http.Request, csrfToken string) {
+func setGraphQLHeaders(req *http.Request, tokens sessionTokens) {
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36")
 	req.Header.Set("Accept", "*/*")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Origin", "https://www.instagram.com")
 	req.Header.Set("Referer", "https://www.instagram.com/")
-	req.Header.Set("X-CSRFToken", csrfToken)
+	req.Header.Set("X-CSRFToken", tokens.csrf)
 	req.Header.Set("X-IG-App-ID", "936619743392459")
 	req.Header.Set("X-ASBD-ID", "359341")
 	req.Header.Set("X-IG-WWW-Claim", "0")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
 	req.Header.Set("Sec-Ch-Ua", `"Google Chrome";v="143", "Chromium";v="143", "Not A(Brand";v="24"`)
-	req.Header.Set("Sec-Ch-Ua-Full-Version-List", `"Google Chrome";v="143.0.0.0", "Chromium";v="143.0.0.0", "Not A(Brand";v="24.0.0.0"`)
 	req.Header.Set("Sec-Ch-Ua-Mobile", "?0")
-	req.Header.Set("Sec-Ch-Ua-Model", `""`)
 	req.Header.Set("Sec-Ch-Ua-Platform", `"macOS"`)
-	req.Header.Set("Sec-Ch-Ua-Platform-Version", `"15.0.0"`)
-	req.Header.Set("Sec-Ch-Prefers-Color-Scheme", "dark")
 	req.Header.Set("Sec-Fetch-Dest", "empty")
 	req.Header.Set("Sec-Fetch-Mode", "cors")
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
-	req.Header.Set("Priority", "u=1, i")
+	if tokens.lsd != "" {
+		req.Header.Set("X-FB-LSD", tokens.lsd)
+	}
 }
 
 func newHTTPClient() (*http.Client, error) {
@@ -197,7 +216,6 @@ func newHTTPClient() (*http.Client, error) {
 }
 
 func checkRedirect(client *http.Client, u string) (string, error) {
-	// Mimic the TS behavior: if URL contains "share", follow it and return the final URL
 	if strings.Contains(u, "/share/") || strings.Contains(u, "/share") {
 		req, err := http.NewRequest(http.MethodGet, u, nil)
 		if err != nil {
@@ -209,7 +227,7 @@ func checkRedirect(client *http.Client, u string) (string, error) {
 			return "", err
 		}
 		defer resp.Body.Close()
-		// final URL after redirects:
+		io.Copy(io.Discard, resp.Body)
 		return resp.Request.URL.String(), nil
 	}
 	return u, nil
@@ -221,7 +239,13 @@ func getShortcode(u string) (string, error) {
 	for i, p := range parts {
 		if _, ok := tags[p]; ok {
 			if i+1 < len(parts) && parts[i+1] != "" {
-				return parts[i+1], nil
+				code := parts[i+1]
+				if q := strings.IndexAny(code, "?#"); q >= 0 {
+					code = code[:q]
+				}
+				if code != "" {
+					return code, nil
+				}
 			}
 			break
 		}
@@ -234,72 +258,111 @@ func invalidateCSRFToken() {
 	csrfTokenLock.Lock()
 	defer csrfTokenLock.Unlock()
 	csrfToken = ""
+	lsdToken = ""
 	csrfTokenExp = time.Time{}
 }
 
-func getCSRFToken(client *http.Client) (string, error) {
+func applyCSRFCookie(client *http.Client, token string) {
+	u, err := url.Parse("https://www.instagram.com/")
+	if err != nil || token == "" {
+		return
+	}
+	client.Jar.SetCookies(u, []*http.Cookie{{
+		Name:   "csrftoken",
+		Value:  token,
+		Path:   "/",
+		Domain: ".instagram.com",
+	}})
+}
+
+func getSessionTokens(client *http.Client) (sessionTokens, error) {
 	csrfTokenLock.Lock()
 	defer csrfTokenLock.Unlock()
 
-	// If in memory token is valid, return it
+	// Reuse cached tokens, but always seed the current client's cookie jar.
 	if csrfToken != "" && time.Now().Before(csrfTokenExp) {
-		return csrfToken, nil
+		applyCSRFCookie(client, csrfToken)
+		return sessionTokens{csrf: csrfToken, lsd: lsdToken}, nil
 	}
 
 	req, err := http.NewRequest(http.MethodGet, "https://www.instagram.com/", nil)
 	if err != nil {
-		return "", err
+		return sessionTokens{}, err
 	}
 	setBrowserHeaders(req)
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", err
+		return sessionTokens{}, err
 	}
 	defer resp.Body.Close()
 
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return sessionTokens{}, err
+	}
+
+	token := ""
 	for _, c := range resp.Cookies() {
 		if c.Name == "csrftoken" && c.Value != "" {
-			csrfToken = c.Value
-			csrfTokenExp = time.Now().Add(10 * time.Minute) // cache por 10 minutos
-			return csrfToken, nil
+			token = c.Value
+			break
 		}
 	}
-	// Fallback: busca no header
-	if cookies := resp.Header["Set-Cookie"]; len(cookies) > 0 {
-		for _, raw := range cookies {
-			if strings.HasPrefix(raw, "csrftoken=") {
-				semi := strings.Index(raw, ";")
-				val := raw[len("csrftoken="):]
-				if semi >= 0 {
-					val = raw[len("csrftoken="):semi]
-				}
-				if val != "" {
-					csrfToken = val
-					csrfTokenExp = time.Now().Add(10 * time.Minute)
-					return csrfToken, nil
+	if token == "" {
+		u, _ := url.Parse("https://www.instagram.com/")
+		for _, c := range client.Jar.Cookies(u) {
+			if c.Name == "csrftoken" && c.Value != "" {
+				token = c.Value
+				break
+			}
+		}
+	}
+	if token == "" {
+		if cookies := resp.Header["Set-Cookie"]; len(cookies) > 0 {
+			for _, raw := range cookies {
+				if strings.HasPrefix(raw, "csrftoken=") {
+					semi := strings.Index(raw, ";")
+					val := raw[len("csrftoken="):]
+					if semi >= 0 {
+						val = raw[len("csrftoken="):semi]
+					}
+					if val != "" {
+						token = val
+						break
+					}
 				}
 			}
 		}
 	}
-	return "", errors.New("CSRF token not found in response headers")
+	if token == "" {
+		return sessionTokens{}, errors.New("CSRF token not found in response headers")
+	}
+
+	lsd := ""
+	if m := lsdPattern.FindSubmatch(body); m != nil {
+		lsd = string(m[1])
+	}
+
+	csrfToken = token
+	lsdToken = lsd
+	csrfTokenExp = time.Now().Add(10 * time.Minute)
+	applyCSRFCookie(client, csrfToken)
+	return sessionTokens{csrf: csrfToken, lsd: lsdToken}, nil
 }
 
-func instagramRequest(client *http.Client, shortcode string, retries int, delay time.Duration) (*node, error) {
+func instagramRequest(client *http.Client, shortcode string, retries int, delay time.Duration) (*mediaItem, error) {
+	// PolarisPostRootQuery — legacy xdt_shortcode_media doc_ids were deprecated mid-2026.
 	const baseURL = "https://www.instagram.com/graphql/query"
-	const docID = "9510064595728286"
+	const docID = "27128499623469141"
 
-	// 1) CSRF token
-	token, err := getCSRFToken(client)
+	tokens, err := getSessionTokens(client)
 	if err != nil {
 		return nil, wrapErr("failed to obtain CSRF", err)
 	}
 
-	// 2) Build form body
 	variables := map[string]interface{}{
-		"shortcode":               shortcode,
-		"fetch_tagged_user_count": nil,
-		"hoisted_comment_id":      nil,
-		"hoisted_reply_id":        nil,
+		"shortcode": shortcode,
+		"__relay_internal__pv__PolarisAIGMMediaWebLabelEnabledrelayprovider": false,
 	}
 	varJSON, err := json.Marshal(variables)
 	if err != nil {
@@ -309,12 +372,15 @@ func instagramRequest(client *http.Client, shortcode string, retries int, delay 
 	form := url.Values{}
 	form.Set("variables", string(varJSON))
 	form.Set("doc_id", docID)
+	if tokens.lsd != "" {
+		form.Set("lsd", tokens.lsd)
+	}
 
 	req, err := http.NewRequest(http.MethodPost, baseURL, bytes.NewBufferString(form.Encode()))
 	if err != nil {
 		return nil, err
 	}
-	setGraphQLHeaders(req, token)
+	setGraphQLHeaders(req, tokens)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -322,10 +388,8 @@ func instagramRequest(client *http.Client, shortcode string, retries int, delay 
 	}
 	defer resp.Body.Close()
 
-	// Retry on 429 / 403 like TS code
 	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized {
 		if retries > 0 {
-			// Invalidate CSRF token so we get a fresh one on retry
 			invalidateCSRFToken()
 
 			wait := delay
@@ -335,18 +399,15 @@ func instagramRequest(client *http.Client, shortcode string, retries int, delay 
 				}
 			}
 
-			// Add jitter (±25% of wait time) to prevent thundering herd
 			jitter := time.Duration(float64(wait) * (0.5 - rand.Float64()) * 0.5)
 			wait += jitter
 
-			// Cap the delay to prevent excessively long waits
 			if wait > cfg.MaxDelay {
 				wait = cfg.MaxDelay
 			}
 
 			time.Sleep(wait)
 
-			// Exponential backoff on the "delay" path
 			nextDelay := delay * 2
 			if nextDelay > cfg.MaxDelay {
 				nextDelay = cfg.MaxDelay
@@ -362,46 +423,51 @@ func instagramRequest(client *http.Client, shortcode string, retries int, delay 
 		return nil, errors.New("failed instagram request: " + resp.Status + " - " + string(b))
 	}
 
-	var gr graphResponse
-	if err := json.NewDecoder(resp.Body).Decode(&gr); err != nil {
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
 		return nil, err
 	}
-	if gr.Data.ShortcodeMedia == nil {
+
+	var gr graphResponse
+	if err := json.Unmarshal(body, &gr); err != nil {
+		return nil, err
+	}
+	if gr.Data.WebInfo == nil || len(gr.Data.WebInfo.Items) == 0 {
 		return nil, errors.New("only posts/reels supported, check if your link is valid")
 	}
-	return gr.Data.ShortcodeMedia, nil
+	return &gr.Data.WebInfo.Items[0], nil
 }
 
-func createOutputData(n *node) (InstagramResponse, error) {
-	if n == nil {
+func createOutputData(item *mediaItem) (InstagramResponse, error) {
+	if item == nil {
 		return InstagramResponse{}, errors.New("nil post data")
 	}
 
 	var out InstagramResponse
 
-	// Post info
-	out.PostInfo.OwnerUsername = n.Owner.Username
-	out.PostInfo.OwnerFullname = n.Owner.FullName
-	out.PostInfo.IsVerified = n.Owner.IsVerified
-	out.PostInfo.IsPrivate = n.Owner.IsPrivate
-	out.PostInfo.Likes = n.EdgeMediaPreviewLike.Count
-	out.PostInfo.IsAd = n.IsAd
-	out.PostInfo.Caption = firstCaption(n.EdgeMediaToCaption)
+	out.PostInfo.OwnerUsername = item.User.Username
+	out.PostInfo.OwnerFullname = item.User.FullName
+	out.PostInfo.IsVerified = item.User.IsVerified
+	out.PostInfo.IsPrivate = item.User.IsPrivate
+	out.PostInfo.Likes = item.LikeCount
+	out.PostInfo.IsAd = item.IsPaidPartnership
+	if item.Caption != nil {
+		out.PostInfo.Caption = item.Caption.Text
+	}
 
-	// Media
 	var urls []string
 	var details []MediaDetail
 
-	if isSidecar(n) {
-		for _, e := range n.EdgeSidecarToChildren.Edges {
-			md := formatMediaDetails(&e.Node)
+	if item.MediaType == 8 && len(item.CarouselMedia) > 0 {
+		for i := range item.CarouselMedia {
+			md := formatMediaDetails(&item.CarouselMedia[i])
 			details = append(details, md)
-			urls = append(urls, mediaURL(&e.Node))
+			urls = append(urls, md.URL)
 		}
 	} else {
-		md := formatMediaDetails(n)
+		md := formatMediaDetails(item)
 		details = append(details, md)
-		urls = append(urls, mediaURL(n))
+		urls = append(urls, md.URL)
 	}
 
 	out.ResultsNumber = len(urls)
@@ -410,55 +476,60 @@ func createOutputData(n *node) (InstagramResponse, error) {
 	return out, nil
 }
 
-func firstCaption(et edgesText) string {
-	if len(et.Edges) == 0 {
-		return ""
+func formatMediaDetails(item *mediaItem) MediaDetail {
+	dims := Dimensions{
+		Width:  item.OriginalWidth,
+		Height: item.OriginalHeight,
 	}
-	return et.Edges[0].Node.Text
-}
+	displayURL := bestImageURL(item)
+	if displayURL != "" && (dims.Width == 0 || dims.Height == 0) {
+		if item.ImageVersions2 != nil && len(item.ImageVersions2.Candidates) > 0 {
+			dims.Width = item.ImageVersions2.Candidates[0].Width
+			dims.Height = item.ImageVersions2.Candidates[0].Height
+		}
+	}
 
-func isSidecar(n *node) bool {
-	return n.Typename == "XDTGraphSidecar"
-}
-
-func formatMediaDetails(n *node) MediaDetail {
-	if n.IsVideo {
-		thumb := n.DisplayURL
+	if item.MediaType == 2 || len(item.VideoVersions) > 0 {
+		videoURL := bestVideoURL(item)
+		thumb := displayURL
+		viewCount := item.ViewCount
+		if viewCount == nil {
+			viewCount = item.PlayCount
+		}
+		if len(item.VideoVersions) > 0 && (dims.Width == 0 || dims.Height == 0) {
+			dims.Width = item.VideoVersions[0].Width
+			dims.Height = item.VideoVersions[0].Height
+		}
 		return MediaDetail{
 			Type:           "video",
-			Dimensions:     n.Dimensions,
-			URL:            n.VideoURL,
-			VideoViewCount: n.VideoViewCount,
+			Dimensions:     dims,
+			URL:            videoURL,
+			VideoViewCount: viewCount,
 			Thumbnail:      &thumb,
 		}
 	}
+
 	return MediaDetail{
 		Type:       "image",
-		Dimensions: n.Dimensions,
-		URL:        n.DisplayURL,
+		Dimensions: dims,
+		URL:        displayURL,
 	}
 }
 
-func mediaURL(n *node) string {
-	if n.IsVideo {
-		return n.VideoURL
+func bestImageURL(item *mediaItem) string {
+	if item.ImageVersions2 == nil || len(item.ImageVersions2.Candidates) == 0 {
+		return ""
 	}
-	return n.DisplayURL
+	return item.ImageVersions2.Candidates[0].URL
+}
+
+func bestVideoURL(item *mediaItem) string {
+	if len(item.VideoVersions) == 0 {
+		return ""
+	}
+	return item.VideoVersions[0].URL
 }
 
 func wrapErr(msg string, err error) error {
 	return errors.New(msg + ": " + err.Error())
 }
-
-/*
-Example usage:
-
-func main() {
-	resp, err := InstagramGetURL("https://www.instagram.com/p/SHORTCODE/", &Config{Retries: 5, Delay: time.Second})
-	if err != nil {
-		log.Fatal(err)
-	}
-	b, _ := json.MarshalIndent(resp, "", "  ")
-	fmt.Println(string(b))
-}
-*/
