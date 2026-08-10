@@ -34,6 +34,7 @@ type Tweet struct {
 	ReplyingTo        *string `json:"replying_to"`
 	ReplyingToStatus  *string `json:"replying_to_status"`
 	Media             *Media  `json:"media"`
+	Quote             *Tweet  `json:"quote,omitempty"`
 	Source            string  `json:"source"`
 	TwitterCard       string  `json:"twitter_card"`
 	Color             *string `json:"color"`
