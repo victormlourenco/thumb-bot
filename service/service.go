@@ -16,20 +16,21 @@ func NewTelegramService(logger *zap.Logger, bot *telego.Bot) *TelegramChannelImp
 	}
 
 	tc.initBlacklistFromEnv()
+	tc.initBunkerAllowedChatsFromEnv()
 
 	return tc
 }
 
 type TelegramChannelImpl struct {
-	logger            *zap.Logger
-	bot               *telego.Bot
-	blacklistedUserID map[int64]struct{}
+	logger               *zap.Logger
+	bot                  *telego.Bot
+	blacklistedUserID    map[int64]struct{}
+	bunkerAllowedChatIDs map[int64]struct{}
 }
 
-func (t *TelegramChannelImpl) initBlacklistFromEnv() {
-	raw := os.Getenv("TELEGRAM_USER_BLACKLIST")
+func parseIDSet(raw, envName string, logger *zap.Logger) map[int64]struct{} {
 	if raw == "" {
-		return
+		return nil
 	}
 
 	ids := make(map[int64]struct{})
@@ -41,14 +42,32 @@ func (t *TelegramChannelImpl) initBlacklistFromEnv() {
 		if id, err := strconv.ParseInt(part, 10, 64); err == nil {
 			ids[id] = struct{}{}
 		} else {
-			t.logger.Warn("invalid user id in TELEGRAM_USER_BLACKLIST", zap.String("value", part), zap.Error(err))
+			logger.Warn("invalid id in "+envName, zap.String("value", part), zap.Error(err))
 		}
 	}
 
-	if len(ids) > 0 {
-		t.blacklistedUserID = ids
-		t.logger.Info("telegram user blacklist initialized", zap.Int("count", len(ids)))
+	if len(ids) == 0 {
+		return nil
 	}
+	return ids
+}
+
+func (t *TelegramChannelImpl) initBlacklistFromEnv() {
+	ids := parseIDSet(os.Getenv("TELEGRAM_USER_BLACKLIST"), "TELEGRAM_USER_BLACKLIST", t.logger)
+	if ids == nil {
+		return
+	}
+	t.blacklistedUserID = ids
+	t.logger.Info("telegram user blacklist initialized", zap.Int("count", len(ids)))
+}
+
+func (t *TelegramChannelImpl) initBunkerAllowedChatsFromEnv() {
+	ids := parseIDSet(os.Getenv("BNKR_ALLOWED_CHAT_IDS"), "BNKR_ALLOWED_CHAT_IDS", t.logger)
+	if ids == nil {
+		return
+	}
+	t.bunkerAllowedChatIDs = ids
+	t.logger.Info("bunker allowed chats initialized", zap.Int("count", len(ids)))
 }
 
 func (t *TelegramChannelImpl) isUserBlacklisted(update telego.Update) bool {
@@ -84,6 +103,11 @@ func (t *TelegramChannelImpl) ProcessMedia(update telego.Update) error {
 	if youtubeErr != nil {
 		t.logger.Error(youtubeErr.Error())
 		return youtubeErr
+	}
+	bunkerErr := t.processBunkerMedia(update)
+	if bunkerErr != nil {
+		t.logger.Error(bunkerErr.Error())
+		return bunkerErr
 	}
 	return nil
 }
