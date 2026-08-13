@@ -58,6 +58,10 @@ func openYouTubeKeyboard(videoURL string) *telego.InlineKeyboardMarkup {
 	return openLinkKeyboard("Abrir no YouTube", videoURL)
 }
 
+func openBunkerKeyboard(clipURL string) *telego.InlineKeyboardMarkup {
+	return openLinkKeyboard("Abrir no Bunker", clipURL)
+}
+
 func (t *TelegramChannelImpl) sendRichMessage(chatID int64, replyToMessageID int, html string, media []richMessageMedia, replyMarkup *telego.InlineKeyboardMarkup) error {
 	reqBody := sendRichMessageRequest{
 		ChatID: chatID,
