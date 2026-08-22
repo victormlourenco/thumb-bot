@@ -112,13 +112,13 @@ func formatAuthorHeader(name, screenName string) string {
 func writeFxTweetHeaderAndText(sb *strings.Builder, tweet fxtwitter.Tweet) {
 	header := formatAuthorHeader(tweet.Author.Name, tweet.Author.ScreenName)
 	text := escapeText(tweet.Text)
-	sb.WriteString("<p><sub>")
+	sb.WriteString("<p>")
 	sb.WriteString(header)
 	if text != "" {
 		sb.WriteString("<br/>")
 		sb.WriteString(strings.ReplaceAll(text, "\n", "<br/>"))
 	}
-	sb.WriteString("</sub></p>\n")
+	sb.WriteString("</p>\n")
 }
 
 func formatFxTweetCaption(tweet fxtwitter.Tweet) string {
@@ -408,13 +408,13 @@ func (t *TelegramChannelImpl) processVxtwitterResponse(update telego.Update, res
 	// Multi-media galleries use one rich message; normal posts use regular sends.
 	if len(medias) > 1 {
 		var htmlBuilder strings.Builder
-		htmlBuilder.WriteString("<p><sub>")
+		htmlBuilder.WriteString("<p>")
 		htmlBuilder.WriteString(formatAuthorHeader(response.UserName, response.UserScreenName))
 		if response.Text != "" {
 			htmlBuilder.WriteString("<br/>")
 			htmlBuilder.WriteString(strings.ReplaceAll(escapeText(response.Text), "\n", "<br/>"))
 		}
-		htmlBuilder.WriteString("</sub></p>\n")
+		htmlBuilder.WriteString("</p>\n")
 		richMedia := appendRichMedia(&htmlBuilder, medias, 1)
 
 		err := t.sendRichMessage(update.Message.Chat.ID, update.Message.MessageID, htmlBuilder.String(), richMedia, keyboard)

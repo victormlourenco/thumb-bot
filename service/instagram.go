@@ -54,13 +54,13 @@ func writeInstagramHeaderAndText(sb *strings.Builder, response instagram.Instagr
 	)
 	caption := escapeText(response.PostInfo.Caption)
 
-	sb.WriteString("<p><sub>")
+	sb.WriteString("<p>")
 	sb.WriteString(header)
 	if caption != "" {
 		sb.WriteString("<br/>")
 		sb.WriteString(strings.ReplaceAll(caption, "\n", "<br/>"))
 	}
-	sb.WriteString("</sub></p>\n")
+	sb.WriteString("</p>\n")
 }
 
 func buildInstagramRichArticle(response instagram.InstagramResponse, medias []resolvedMedia) (string, []richMessageMedia) {
