@@ -190,14 +190,14 @@ func (t *TelegramChannelImpl) processInstagramMedia(update telego.Update) error 
 		medias := resolveInstagramMedia(response.MediaDetails)
 		caption := formatInstagramCaption(response)
 
-		// Carousels use one rich message; normal single posts use regular sends.
-		if len(medias) > 1 {
+		// Carousels and long captions use one rich message (captions cap at 1024 chars).
+		if len(medias) > 1 || exceedsTelegramLimit(caption, true) {
 			keyboard := openInstagramKeyboard(postURL)
 			htmlBody, richMedia := buildInstagramRichArticle(response, medias)
 			if err := t.sendRichMessage(update.Message.Chat.ID, update.Message.MessageID, htmlBody, richMedia, keyboard); err == nil {
 				return nil
 			}
-			t.logger.Warn("sendRichMessage failed for instagram album, falling back", zap.Error(err))
+			t.logger.Warn("sendRichMessage failed for instagram, falling back", zap.Error(err))
 		}
 
 		if err := t.sendInstagramMediaWithButton(update, response.MediaDetails, caption, postURL); err != nil {

@@ -6,9 +6,23 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"unicode/utf8"
 
 	"github.com/mymmrac/telego"
 )
+
+const (
+	telegramCaptionLimit = 1024
+	telegramMessageLimit = 4096
+)
+
+func exceedsTelegramLimit(text string, hasMedia bool) bool {
+	limit := telegramMessageLimit
+	if hasMedia {
+		limit = telegramCaptionLimit
+	}
+	return utf8.RuneCountInString(text) > limit
+}
 
 type richMessageMedia struct {
 	ID    string         `json:"id"`
