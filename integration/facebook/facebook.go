@@ -14,16 +14,26 @@ import (
 )
 
 type Response struct {
-	AuthorName   string
-	AuthorURL    string
-	Caption      string
-	PostURL      string
-	MediaDetails []MediaDetail
+	AuthorName    string
+	AuthorURL     string
+	Caption       string
+	PostURL       string
+	MediaDetails  []MediaDetail
+	IsMarketplace bool
+	Title         string
+	Price         string
+	Location      string
 }
 
 type MediaDetail struct {
 	Type string // "photo" | "video"
 	URL  string
+}
+
+type listingPhoto struct {
+	Image struct {
+		URI string `json:"uri"`
+	} `json:"image"`
 }
 
 var (
@@ -136,7 +146,9 @@ func hasUsefulContent(htmlBody string) bool {
 		strings.Contains(htmlBody, "browser_native_sd_url") ||
 		strings.Contains(htmlBody, `"__typename":"Photo"`) ||
 		strings.Contains(htmlBody, `"message":{"text":`) ||
-		strings.Contains(htmlBody, `property="og:image"`)
+		strings.Contains(htmlBody, `property="og:image"`) ||
+		strings.Contains(htmlBody, `"marketplace_listing_title"`) ||
+		strings.Contains(htmlBody, `"listing_photos"`)
 }
 
 func isLoginWall(htmlBody string) bool {
@@ -144,6 +156,10 @@ func isLoginWall(htmlBody string) bool {
 }
 
 func parseHTML(htmlBody, fallbackURL string) Response {
+	if listing, ok := parseMarketplace(htmlBody, fallbackURL); ok {
+		return listing
+	}
+
 	ogs := parseOGTags(htmlBody)
 	authorName, authorURL := extractAuthor(htmlBody)
 	if authorName == "" {
@@ -177,6 +193,186 @@ func parseHTML(htmlBody, fallbackURL string) Response {
 		Caption:      caption,
 		PostURL:      postURL,
 		MediaDetails: media,
+	}
+}
+
+func isMarketplacePage(htmlBody, pageURL string) bool {
+	if strings.Contains(pageURL, "/marketplace/item/") {
+		return true
+	}
+	return strings.Contains(htmlBody, `"marketplace_listing_title"`) && strings.Contains(htmlBody, `"listing_photos"`)
+}
+
+func marketplaceDetailsWindow(htmlBody string) string {
+	i := strings.Index(htmlBody, `"redacted_description"`)
+	if i < 0 {
+		return ""
+	}
+	to := i + 3000
+	if to > len(htmlBody) {
+		to = len(htmlBody)
+	}
+	return htmlBody[i:to]
+}
+
+func parseMarketplace(htmlBody, fallbackURL string) (Response, bool) {
+	if !isMarketplacePage(htmlBody, fallbackURL) {
+		return Response{}, false
+	}
+
+	ogs := parseOGTags(htmlBody)
+	postURL := firstNonEmpty(canonicalURL(htmlBody), ogs["og:url"], fallbackURL)
+	postURL = cleanPostURL(postURL)
+
+	details := marketplaceDetailsWindow(htmlBody)
+	title := firstNonEmpty(
+		firstJSONString(details, "base_marketplace_listing_title"),
+		firstJSONString(details, "marketplace_listing_title"),
+		ogs["og:title"],
+	)
+	if i := strings.Index(title, " | "); i >= 0 {
+		title = strings.TrimSpace(title[:i])
+	}
+
+	caption := nestedJSONText(details, "redacted_description")
+	if caption == "" {
+		caption = nestedJSONText(htmlBody, "redacted_description")
+	}
+	if caption == "" {
+		caption = firstNonEmpty(ogs["og:description"], metaDescription(htmlBody))
+	}
+
+	price := firstNonEmpty(
+		firstJSONString(details, "formatted_amount_zeros_stripped"),
+		firstJSONString(htmlBody, "formatted_amount_zeros_stripped"),
+	)
+	location := firstNonEmpty(
+		nestedJSONText(details, "location_text"),
+		nestedJSONText(htmlBody, "location_text"),
+	)
+
+	var media []MediaDetail
+	for _, imageURL := range extractListingPhotos(htmlBody) {
+		media = append(media, MediaDetail{Type: "photo", URL: imageURL})
+	}
+	if len(media) == 0 && ogs["og:image"] != "" {
+		media = append(media, MediaDetail{Type: "photo", URL: html.UnescapeString(ogs["og:image"])})
+	}
+
+	if title == "" && caption == "" && len(media) == 0 {
+		return Response{}, false
+	}
+
+	return Response{
+		AuthorName:    title,
+		AuthorURL:     postURL,
+		Caption:       caption,
+		PostURL:       postURL,
+		MediaDetails:  media,
+		IsMarketplace: true,
+		Title:         title,
+		Price:         price,
+		Location:      location,
+	}, true
+}
+
+func nestedJSONText(htmlBody, key string) string {
+	needle := `"` + key + `":{"text":`
+	i := strings.Index(htmlBody, needle)
+	if i < 0 {
+		return ""
+	}
+	text, err := readJSONString(htmlBody[i+len(needle):])
+	if err != nil {
+		return ""
+	}
+	return text
+}
+
+func metaDescription(htmlBody string) string {
+	m := metaDescPattern.FindStringSubmatch(htmlBody)
+	if len(m) < 2 {
+		return ""
+	}
+	return html.UnescapeString(m[1])
+}
+
+func extractListingPhotos(htmlBody string) []string {
+	i := strings.Index(htmlBody, `"listing_photos":`)
+	if i < 0 {
+		return nil
+	}
+	rest := strings.TrimSpace(htmlBody[i+len(`"listing_photos":`):])
+	raw, err := readJSONValue(rest)
+	if err != nil {
+		return nil
+	}
+	var photos []listingPhoto
+	if err := json.Unmarshal(raw, &photos); err != nil {
+		return nil
+	}
+
+	seen := map[string]struct{}{}
+	var urls []string
+	for _, photo := range photos {
+		u := strings.TrimSpace(photo.Image.URI)
+		if u == "" || isTinyImage(u) {
+			continue
+		}
+		key := mediaDedupeKey(u)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		urls = append(urls, u)
+		if len(urls) == 10 {
+			break
+		}
+	}
+	return urls
+}
+
+func readJSONValue(s string) ([]byte, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, errors.New("empty json value")
+	}
+	switch s[0] {
+	case '{', '[':
+		depth := 0
+		inString := false
+		escape := false
+		for i := 0; i < len(s); i++ {
+			c := s[i]
+			if inString {
+				if escape {
+					escape = false
+					continue
+				}
+				if c == '\\' {
+					escape = true
+					continue
+				}
+				if c == '"' {
+					inString = false
+				}
+				continue
+			}
+			switch c {
+			case '"':
+				inString = true
+			case '{', '[':
+				depth++
+			case '}', ']':
+				depth--
+				if depth == 0 {
+					return []byte(s[:i+1]), nil
+				}
+			}
+		}
+		return nil, errors.New("unterminated json value")
+	default:
+		return nil, errors.New("unsupported json value")
 	}
 }
 
@@ -365,7 +561,7 @@ func isProfileURL(raw string) bool {
 	parts := strings.Split(path, "/")
 	switch parts[0] {
 	case "reel", "reels", "watch", "photo", "photos", "videos", "posts", "share", "groups",
-		"permalink.php", "story.php", "video.php", "watchparty", "events", "hashtag":
+		"permalink.php", "story.php", "video.php", "watchparty", "events", "hashtag", "marketplace":
 		return false
 	case "people":
 		return len(parts) >= 3
@@ -386,7 +582,7 @@ func authorURLFromCanonical(raw string) string {
 		return ""
 	}
 	switch parts[0] {
-	case "reel", "reels", "watch", "photo", "share", "permalink.php", "story.php", "video.php":
+	case "reel", "reels", "watch", "photo", "share", "permalink.php", "story.php", "video.php", "marketplace":
 		return ""
 	case "people":
 		if len(parts) >= 3 {
