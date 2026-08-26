@@ -2,6 +2,7 @@ package facebook
 
 import (
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -34,6 +35,8 @@ func TestIsProfileURL(t *testing.T) {
 		"https://www.facebook.com/reel/730293269054758/":            false,
 		"https://www.facebook.com/watch/?v=123":                     false,
 		"https://www.facebook.com/hashtag/reels":                    false,
+		"https://www.facebook.com/marketplace/item/123":             false,
+		"https://www.facebook.com/marketplace":                      false,
 	}
 	for raw, want := range tests {
 		if got := isProfileURL(raw); got != want {
@@ -133,6 +136,47 @@ func TestExtractPhotoSkipsTinyAndCaps(t *testing.T) {
 	got := extractPhotoURLs(htmlBody, "")
 	if len(got) != 1 {
 		t.Fatalf("got %d photos: %v", len(got), got)
+	}
+}
+
+func TestParseHTMLMarketplace(t *testing.T) {
+	htmlBody := `
+<link rel="canonical" href="https://www.facebook.com/marketplace/item/1201486206389924/" />
+<meta property="og:title" content="Top preto" />
+<meta property="og:description" content="Top preto&#10;&#10;TAM. Único" />
+<meta property="og:url" content="https://www.facebook.com/marketplace/item/1201486206389924/" />
+<meta property="og:image" content="https://scontent.fbcdn.net/v/t39/related.jpg" />
+"marketplace_listing_title":"Bicicleta ergometrica"
+"listing_photos":[{"__typename":"ProductImage","image":{"height":960,"width":818,"uri":"https:\/\/scontent.fbcdn.net\/v\/t39.84726-6\/item1.jpg?oh=1"},"id":"1"},{"__typename":"ProductImage","image":{"uri":"https:\/\/scontent.fbcdn.net\/v\/t45.5328-4\/item2.jpg?oh=2"},"id":"2"}]
+"redacted_description":{"text":"Top preto\n\nTAM. Único\n\nApenas $ 10,00"},"creation_time":1,"location_text":{"text":"Rio de Janeiro, RJ"},"listing_price":{"formatted_amount_zeros_stripped":"R$10","amount":"10.00","currency":"BRL"},"base_marketplace_listing_title":"Top preto","marketplace_listing_title":"Top preto"
+`
+	got := parseHTML(htmlBody, "https://www.facebook.com/marketplace/item/1201486206389924/?ref=browse_tab")
+	if !got.IsMarketplace {
+		t.Fatal("expected marketplace listing")
+	}
+	if got.Title != "Top preto" {
+		t.Fatalf("title=%q", got.Title)
+	}
+	if got.Price != "R$10" {
+		t.Fatalf("price=%q", got.Price)
+	}
+	if got.Location != "Rio de Janeiro, RJ" {
+		t.Fatalf("location=%q", got.Location)
+	}
+	if !strings.Contains(got.Caption, "TAM. Único") {
+		t.Fatalf("caption=%q", got.Caption)
+	}
+	if got.PostURL != "https://www.facebook.com/marketplace/item/1201486206389924/" {
+		t.Fatalf("post url=%q", got.PostURL)
+	}
+	if len(got.MediaDetails) != 2 {
+		t.Fatalf("media=%+v", got.MediaDetails)
+	}
+	if !strings.Contains(got.MediaDetails[0].URL, "item1.jpg") {
+		t.Fatalf("first photo=%q", got.MediaDetails[0].URL)
+	}
+	if !strings.Contains(got.MediaDetails[1].URL, "item2.jpg") {
+		t.Fatalf("second photo=%q", got.MediaDetails[1].URL)
 	}
 }
 

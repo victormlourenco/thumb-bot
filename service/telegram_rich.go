@@ -72,6 +72,10 @@ func openFacebookKeyboard(postURL string) *telego.InlineKeyboardMarkup {
 	return openLinkKeyboard("Abrir no Facebook", postURL)
 }
 
+func openMarketplaceKeyboard(listingURL string) *telego.InlineKeyboardMarkup {
+	return openLinkKeyboard("Abrir no Marketplace", listingURL)
+}
+
 func openYouTubeKeyboard(videoURL string) *telego.InlineKeyboardMarkup {
 	return openLinkKeyboard("Abrir no YouTube", videoURL)
 }

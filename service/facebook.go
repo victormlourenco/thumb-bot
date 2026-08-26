@@ -48,6 +48,9 @@ func formatFacebookHeader(response facebook.Response) string {
 }
 
 func formatFacebookCaption(response facebook.Response) string {
+	if response.IsMarketplace {
+		return formatMarketplaceCaption(response)
+	}
 	header := formatFacebookHeader(response)
 	if response.Caption == "" {
 		return header
@@ -55,16 +58,48 @@ func formatFacebookCaption(response facebook.Response) string {
 	return fmt.Sprintf("%s:\n%s", header, escapeText(response.Caption))
 }
 
-func writeFacebookHeaderAndText(sb *strings.Builder, response facebook.Response) {
-	header := formatFacebookHeader(response)
-	caption := escapeText(response.Caption)
-
-	sb.WriteString("<p>")
-	sb.WriteString(header)
-	if caption != "" {
-		sb.WriteString("<br/>")
-		sb.WriteString(strings.ReplaceAll(caption, "\n", "<br/>"))
+func formatMarketplaceCaption(response facebook.Response) string {
+	listingURL := response.PostURL
+	if listingURL == "" {
+		listingURL = "https://www.facebook.com/marketplace"
 	}
+
+	title := response.Title
+	if title == "" {
+		title = response.AuthorName
+	}
+	if title == "" {
+		title = "Facebook Marketplace"
+	}
+
+	var parts []string
+	parts = append(parts, fmt.Sprintf(`<b><a href="%s">%s</a></b>`, listingURL, escapeText(title)))
+
+	var meta []string
+	if response.Price != "" {
+		meta = append(meta, "<b>"+escapeText(response.Price)+"</b>")
+	}
+	if response.Location != "" {
+		meta = append(meta, escapeText(response.Location))
+	}
+	if len(meta) > 0 {
+		parts = append(parts, strings.Join(meta, " · "))
+	}
+
+	desc := strings.TrimSpace(response.Caption)
+	if title != "" && strings.HasPrefix(desc, title) {
+		desc = strings.TrimSpace(strings.TrimPrefix(desc, title))
+	}
+	if desc != "" {
+		parts = append(parts, escapeText(desc))
+	}
+	return strings.Join(parts, "\n")
+}
+
+func writeFacebookHeaderAndText(sb *strings.Builder, response facebook.Response) {
+	text := formatFacebookCaption(response)
+	sb.WriteString("<p>")
+	sb.WriteString(strings.ReplaceAll(text, "\n", "<br/>"))
 	sb.WriteString("</p>\n")
 }
 
@@ -93,14 +128,21 @@ func facebookUsername(authorURL string) string {
 		return ""
 	}
 	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
-	if len(parts) != 1 || parts[0] == "" || parts[0] == "profile.php" {
+	if len(parts) != 1 || parts[0] == "" || parts[0] == "profile.php" || parts[0] == "marketplace" {
 		return ""
 	}
 	return parts[0]
 }
 
-func (t *TelegramChannelImpl) sendFacebookMediaWithButton(update telego.Update, details []facebook.MediaDetail, caption, postURL string) error {
-	keyboard := openFacebookKeyboard(postURL)
+func facebookKeyboard(postURL string, marketplace bool) *telego.InlineKeyboardMarkup {
+	if marketplace {
+		return openMarketplaceKeyboard(postURL)
+	}
+	return openFacebookKeyboard(postURL)
+}
+
+func (t *TelegramChannelImpl) sendFacebookMediaWithButton(update telego.Update, details []facebook.MediaDetail, caption, postURL string, marketplace bool) error {
+	keyboard := facebookKeyboard(postURL, marketplace)
 	chatID := telego.ChatID{ID: update.Message.Chat.ID}
 	replyTo := update.Message.MessageID
 
@@ -211,7 +253,7 @@ func (t *TelegramChannelImpl) processFacebookMedia(update telego.Update) error {
 
 	medias := resolveFacebookMedia(response.MediaDetails)
 	caption := formatFacebookCaption(response)
-	keyboard := openFacebookKeyboard(postURL)
+	keyboard := facebookKeyboard(postURL, response.IsMarketplace)
 
 	if len(medias) > 1 || exceedsTelegramLimit(caption, len(medias) > 0) {
 		htmlBody, richMedia := buildFacebookRichArticle(response, medias)
@@ -223,7 +265,7 @@ func (t *TelegramChannelImpl) processFacebookMedia(update telego.Update) error {
 	}
 
 	if len(response.MediaDetails) > 0 {
-		if err := t.sendFacebookMediaWithButton(update, response.MediaDetails, caption, postURL); err != nil {
+		if err := t.sendFacebookMediaWithButton(update, response.MediaDetails, caption, postURL, response.IsMarketplace); err != nil {
 			t.logger.Error("failed to send facebook media", zap.Error(err))
 			return err
 		}
