@@ -6,9 +6,23 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"unicode/utf8"
 
 	"github.com/mymmrac/telego"
 )
+
+const (
+	telegramCaptionLimit = 1024
+	telegramMessageLimit = 4096
+)
+
+func exceedsTelegramLimit(text string, hasMedia bool) bool {
+	limit := telegramMessageLimit
+	if hasMedia {
+		limit = telegramCaptionLimit
+	}
+	return utf8.RuneCountInString(text) > limit
+}
 
 type richMessageMedia struct {
 	ID    string         `json:"id"`
@@ -52,6 +66,10 @@ func openTwitterKeyboard(tweetURL string) *telego.InlineKeyboardMarkup {
 
 func openInstagramKeyboard(postURL string) *telego.InlineKeyboardMarkup {
 	return openLinkKeyboard("Abrir no Instagram", postURL)
+}
+
+func openFacebookKeyboard(postURL string) *telego.InlineKeyboardMarkup {
+	return openLinkKeyboard("Abrir no Facebook", postURL)
 }
 
 func openYouTubeKeyboard(videoURL string) *telego.InlineKeyboardMarkup {

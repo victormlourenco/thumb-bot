@@ -99,6 +99,11 @@ func (t *TelegramChannelImpl) ProcessMedia(update telego.Update) error {
 		t.logger.Error(instagramErr.Error())
 		return instagramErr
 	}
+	facebookErr := t.processFacebookMedia(update)
+	if facebookErr != nil {
+		t.logger.Error(facebookErr.Error())
+		return facebookErr
+	}
 	youtubeErr := t.processYouTubeMedia(update)
 	if youtubeErr != nil {
 		t.logger.Error(youtubeErr.Error())
