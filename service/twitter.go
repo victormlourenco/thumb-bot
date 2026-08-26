@@ -244,6 +244,19 @@ func buildFxMediaArticle(tweet fxtwitter.Tweet, medias []resolvedMedia) (string,
 	return htmlBuilder.String(), mediaList
 }
 
+func buildVxMediaArticle(response vxtwitter.Response, medias []resolvedMedia) (string, []richMessageMedia) {
+	var htmlBuilder strings.Builder
+	htmlBuilder.WriteString("<p>")
+	htmlBuilder.WriteString(formatAuthorHeader(response.UserName, response.UserScreenName))
+	if response.Text != "" {
+		htmlBuilder.WriteString("<br/>")
+		htmlBuilder.WriteString(strings.ReplaceAll(escapeText(response.Text), "\n", "<br/>"))
+	}
+	htmlBuilder.WriteString("</p>\n")
+	mediaList := appendRichMedia(&htmlBuilder, medias, 1)
+	return htmlBuilder.String(), mediaList
+}
+
 func buildFxMediaGroup(items []resolvedMedia, caption string) []telego.InputMedia {
 	var mediaGroup []telego.InputMedia
 	for i, media := range items {
@@ -333,32 +346,32 @@ func (t *TelegramChannelImpl) processFxtwitterResponse(update telego.Update, res
 		quoteMedias = resolveFxMediaItems(response.Tweet.Quote.Media.All)
 	}
 
-	// Quotes with media use sendRichMessage so quoted media renders inside the blockquote.
-	if response.Tweet.Quote != nil && (len(mainMedias) > 0 || len(quoteMedias) > 0) {
-		htmlBody, richMedia := buildFxQuoteArticle(response.Tweet, mainMedias, quoteMedias)
+	medias := mainMedias
+	if len(medias) == 0 {
+		medias = quoteMedias
+	}
+	caption := formatFxTweetCaption(response.Tweet)
+
+	quoteWithMedia := response.Tweet.Quote != nil && (len(mainMedias) > 0 || len(quoteMedias) > 0)
+	gallery := len(medias) > 1 && response.Tweet.Quote == nil
+	tooLong := response.Tweet.IsNoteTweet || exceedsTelegramLimit(caption, len(medias) > 0)
+
+	// Quotes with media, galleries, and long/note tweets use sendRichMessage
+	// (regular captions cap at 1024 chars; text messages at 4096).
+	if quoteWithMedia || gallery || tooLong {
+		var htmlBody string
+		var richMedia []richMessageMedia
+		if response.Tweet.Quote != nil {
+			htmlBody, richMedia = buildFxQuoteArticle(response.Tweet, mainMedias, quoteMedias)
+		} else {
+			htmlBody, richMedia = buildFxMediaArticle(response.Tweet, medias)
+		}
 		err := t.sendRichMessage(update.Message.Chat.ID, update.Message.MessageID, htmlBody, richMedia, keyboard)
 		if err == nil {
 			return nil
 		}
 		t.logger.Warn("sendRichMessage failed, falling back", zap.Error(err))
 	}
-
-	medias := mainMedias
-	if len(medias) == 0 {
-		medias = quoteMedias
-	}
-
-	// Multi-media galleries use one rich message (tg-collage + button).
-	if len(medias) > 1 && response.Tweet.Quote == nil {
-		htmlBody, richMedia := buildFxMediaArticle(response.Tweet, medias)
-		err := t.sendRichMessage(update.Message.Chat.ID, update.Message.MessageID, htmlBody, richMedia, keyboard)
-		if err == nil {
-			return nil
-		}
-		t.logger.Warn("sendRichMessage failed for media album, falling back", zap.Error(err))
-	}
-
-	caption := formatFxTweetCaption(response.Tweet)
 
 	if len(medias) > 0 {
 		if err := t.sendTwitterMediaWithButton(update, medias, caption, tweetURL); err != nil {
@@ -405,23 +418,14 @@ func (t *TelegramChannelImpl) processVxtwitterResponse(update telego.Update, res
 		})
 	}
 
-	// Multi-media galleries use one rich message; normal posts use regular sends.
-	if len(medias) > 1 {
-		var htmlBuilder strings.Builder
-		htmlBuilder.WriteString("<p>")
-		htmlBuilder.WriteString(formatAuthorHeader(response.UserName, response.UserScreenName))
-		if response.Text != "" {
-			htmlBuilder.WriteString("<br/>")
-			htmlBuilder.WriteString(strings.ReplaceAll(escapeText(response.Text), "\n", "<br/>"))
-		}
-		htmlBuilder.WriteString("</p>\n")
-		richMedia := appendRichMedia(&htmlBuilder, medias, 1)
-
-		err := t.sendRichMessage(update.Message.Chat.ID, update.Message.MessageID, htmlBuilder.String(), richMedia, keyboard)
+	// Galleries and long tweets use one rich message; normal posts use regular sends.
+	if len(medias) > 1 || exceedsTelegramLimit(caption, len(medias) > 0) {
+		htmlBody, richMedia := buildVxMediaArticle(response, medias)
+		err := t.sendRichMessage(update.Message.Chat.ID, update.Message.MessageID, htmlBody, richMedia, keyboard)
 		if err == nil {
 			return nil
 		}
-		t.logger.Warn("sendRichMessage failed for vxtwitter album, falling back", zap.Error(err))
+		t.logger.Warn("sendRichMessage failed for vxtwitter, falling back", zap.Error(err))
 	}
 
 	if len(medias) > 0 {
