@@ -21,6 +21,8 @@ var facebookHosts = []string{
 	"www.fb.com",
 	"fb.watch",
 	"www.fb.watch",
+	"l.facebook.com",
+	"lm.facebook.com",
 }
 
 func formatFacebookHeader(response facebook.Response) string {
@@ -218,7 +220,8 @@ func (t *TelegramChannelImpl) processFacebookMedia(update telego.Update) error {
 		return nil
 	}
 
-	fbURL, err := url.Parse(links[0])
+	rawURL := facebook.CanonicalizeURL(links[0])
+	fbURL, err := url.Parse(rawURL)
 	if err != nil {
 		t.logger.Error("failed to parse facebook URL", zap.Error(err))
 		return err

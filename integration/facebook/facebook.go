@@ -37,10 +37,14 @@ type listingPhoto struct {
 }
 
 var (
-	canonicalPattern = regexp.MustCompile(`(?i)<link\s+rel="canonical"\s+href="([^"]+)"`)
-	metaDescPattern  = regexp.MustCompile(`(?i)<meta\s+name="description"\s+content="([^"]*)"`)
-	ogPattern        = regexp.MustCompile(`(?i)<meta\s+property="(og:[^"]+)"\s+content="([^"]*)"`)
-	imageURIPattern  = regexp.MustCompile(`"(?:full_image|viewer_image|image)":\{"uri":("https:\\/\\/scontent[^"]+")`)
+	canonicalPattern    = regexp.MustCompile(`(?i)<link\s+rel="canonical"\s+href="([^"]+)"`)
+	metaDescPattern     = regexp.MustCompile(`(?i)<meta\s+name="description"\s+content="([^"]*)"`)
+	ogPattern           = regexp.MustCompile(`(?i)<meta\s+property="(og:[^"]+)"\s+content="([^"]*)"`)
+	ogPatternAlt        = regexp.MustCompile(`(?i)<meta\s+content="([^"]*)"\s+property="(og:[^"]+)"`)
+	pageTitlePattern    = regexp.MustCompile(`(?i)<title>([^<]+)</title>`)
+	locationDashPattern = regexp.MustCompile(`\s+[—–]\s+`)
+	pricePattern        = regexp.MustCompile(`(?i)(?:R\$|\$)\s*[\d.,]+`)
+	imageURIPattern     = regexp.MustCompile(`"(?:full_image|viewer_image|image)":\{"uri":("https:\\/\\/scontent[^"]+")`)
 )
 
 var skipCaptions = map[string]bool{
@@ -55,16 +59,17 @@ func Fetch(inputURL string) (Response, error) {
 		return Response{}, err
 	}
 
+	inputURL = CanonicalizeURL(inputURL)
 	htmlBody, finalURL, err := fetchHTML(client, inputURL)
 	if err != nil {
 		return Response{}, err
 	}
 
-	out := parseHTML(htmlBody, finalURL)
-	if isLoginWall(htmlBody) && len(out.MediaDetails) == 0 {
+	out := parseHTML(htmlBody, firstNonEmpty(finalURL, inputURL))
+	if isLoginWall(htmlBody) && len(out.MediaDetails) == 0 && out.Caption == "" {
 		return Response{}, errors.New("facebook post is private or requires login")
 	}
-	if len(out.MediaDetails) == 0 && out.Caption == "" && out.AuthorName == "" {
+	if len(out.MediaDetails) == 0 && out.Caption == "" && out.AuthorName == "" && out.Title == "" {
 		return Response{}, errors.New("could not extract facebook post")
 	}
 	return out, nil
@@ -101,21 +106,62 @@ func setCrawlerHeaders(req *http.Request) {
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 }
 
+func setGooglebotHeaders(req *http.Request) {
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+}
+
 func fetchHTML(client *http.Client, inputURL string) (string, string, error) {
-	htmlBody, finalURL, err := doFetch(client, inputURL, setBrowserHeaders)
-	if err == nil && hasUsefulContent(htmlBody) && !isLoginWall(htmlBody) {
-		return htmlBody, finalURL, nil
+	attempts := []func(*http.Request){
+		setCrawlerHeaders,
+		setBrowserHeaders,
+		setGooglebotHeaders,
 	}
 
-	html2, final2, err2 := doFetch(client, inputURL, setCrawlerHeaders)
-	if err2 == nil && (hasUsefulContent(html2) || htmlBody == "") {
-		return html2, final2, nil
+	var bestHTML, bestURL string
+	var bestScore int
+	var lastErr error
+	for i, headerFn := range attempts {
+		htmlBody, finalURL, err := doFetch(client, inputURL, headerFn)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		score := contentScore(htmlBody)
+		if score > bestScore {
+			bestHTML, bestURL, bestScore = htmlBody, finalURL, score
+		}
+		if score >= 100 {
+			return htmlBody, finalURL, nil
+		}
+		// After crawler+browser, skip Googlebot if we already have a usable preview.
+		if i >= 1 && bestScore >= 10 {
+			break
+		}
 	}
 
-	if err != nil {
-		return "", "", err
+	if bestHTML != "" {
+		return bestHTML, bestURL, nil
 	}
-	return htmlBody, finalURL, nil
+	if lastErr != nil {
+		return "", "", lastErr
+	}
+	return "", "", errors.New("failed facebook request")
+}
+
+func contentScore(htmlBody string) int {
+	if isLoginWall(htmlBody) {
+		return 0
+	}
+	score := 0
+	if hasFullContent(htmlBody) {
+		score += 100
+	}
+	if hasOGPreview(htmlBody) {
+		score += 10
+	}
+	return score
 }
 
 func doFetch(client *http.Client, inputURL string, headerFn func(*http.Request)) (string, string, error) {
@@ -141,18 +187,42 @@ func doFetch(client *http.Client, inputURL string, headerFn func(*http.Request))
 	return string(body), resp.Request.URL.String(), nil
 }
 
-func hasUsefulContent(htmlBody string) bool {
+func hasFullContent(htmlBody string) bool {
 	return strings.Contains(htmlBody, "browser_native_hd_url") ||
 		strings.Contains(htmlBody, "browser_native_sd_url") ||
 		strings.Contains(htmlBody, `"__typename":"Photo"`) ||
 		strings.Contains(htmlBody, `"message":{"text":`) ||
-		strings.Contains(htmlBody, `property="og:image"`) ||
 		strings.Contains(htmlBody, `"marketplace_listing_title"`) ||
-		strings.Contains(htmlBody, `"listing_photos"`)
+		strings.Contains(htmlBody, `"listing_photos"`) ||
+		strings.Contains(htmlBody, `"redacted_description"`)
+}
+
+func hasOGPreview(htmlBody string) bool {
+	ogs := parseOGTags(htmlBody)
+	title := strings.TrimSpace(ogs["og:title"])
+	if isGenericFacebookTitle(title) {
+		return false
+	}
+	return title != "" && (ogs["og:image"] != "" || ogs["og:description"] != "")
+}
+
+func isGenericFacebookTitle(title string) bool {
+	t := strings.ToLower(strings.TrimSpace(title))
+	return t == "" || t == "facebook" || strings.HasPrefix(t, "log in") || strings.HasPrefix(t, "log into")
 }
 
 func isLoginWall(htmlBody string) bool {
-	return strings.Contains(htmlBody, "Log in or sign up to view")
+	switch {
+	case strings.Contains(htmlBody, "Log in or sign up to view"):
+		return true
+	case strings.Contains(htmlBody, "<title>Log into Facebook"):
+		return true
+	case strings.Contains(htmlBody, "<title>Log in to Facebook"):
+		return true
+	default:
+		ogs := parseOGTags(htmlBody)
+		return isGenericFacebookTitle(ogs["og:title"]) && !hasFullContent(htmlBody)
+	}
 }
 
 func parseHTML(htmlBody, fallbackURL string) Response {
@@ -249,7 +319,11 @@ func parseMarketplace(htmlBody, fallbackURL string) (Response, bool) {
 	location := firstNonEmpty(
 		nestedJSONText(details, "location_text"),
 		nestedJSONText(htmlBody, "location_text"),
+		locationFromPageTitle(htmlBody),
 	)
+	if price == "" {
+		price = priceFromText(caption)
+	}
 
 	var media []MediaDetail
 	for _, imageURL := range extractListingPhotos(htmlBody) {
@@ -260,6 +334,9 @@ func parseMarketplace(htmlBody, fallbackURL string) (Response, bool) {
 	}
 
 	if title == "" && caption == "" && len(media) == 0 {
+		return Response{}, false
+	}
+	if isGenericFacebookTitle(title) && len(media) == 0 && !strings.Contains(htmlBody, `"listing_photos"`) {
 		return Response{}, false
 	}
 
@@ -380,6 +457,11 @@ func parseOGTags(htmlBody string) map[string]string {
 	out := map[string]string{}
 	for _, m := range ogPattern.FindAllStringSubmatch(htmlBody, -1) {
 		out[m[1]] = html.UnescapeString(m[2])
+	}
+	for _, m := range ogPatternAlt.FindAllStringSubmatch(htmlBody, -1) {
+		if _, exists := out[m[2]]; !exists {
+			out[m[2]] = html.UnescapeString(m[1])
+		}
 	}
 	return out
 }
@@ -597,6 +679,49 @@ func authorURLFromCanonical(raw string) string {
 	default:
 		return "https://www.facebook.com/" + parts[0]
 	}
+}
+
+func locationFromPageTitle(htmlBody string) string {
+	m := pageTitlePattern.FindStringSubmatch(htmlBody)
+	if len(m) < 2 {
+		return ""
+	}
+	title := html.UnescapeString(m[1])
+	if i := strings.Index(title, " | "); i >= 0 {
+		title = title[:i]
+	}
+	parts := locationDashPattern.Split(title, -1)
+	if len(parts) < 2 {
+		return ""
+	}
+	return strings.TrimSpace(parts[len(parts)-1])
+}
+
+func priceFromText(text string) string {
+	return strings.TrimSpace(pricePattern.FindString(text))
+}
+
+func CanonicalizeURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	raw = strings.TrimRight(raw, ".,);]>\"'")
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	host := strings.ToLower(parsed.Host)
+	if host == "l.facebook.com" || host == "lm.facebook.com" {
+		if u := parsed.Query().Get("u"); u != "" {
+			if decoded, err := url.QueryUnescape(u); err == nil {
+				return CanonicalizeURL(decoded)
+			}
+			return CanonicalizeURL(u)
+		}
+	}
+	switch host {
+	case "fb.com", "www.fb.com", "m.facebook.com", "web.facebook.com", "mbasic.facebook.com":
+		parsed.Host = "www.facebook.com"
+	}
+	return cleanPostURL(parsed.String())
 }
 
 func cleanPostURL(raw string) string {
