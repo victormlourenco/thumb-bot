@@ -180,6 +180,57 @@ func TestParseHTMLMarketplace(t *testing.T) {
 	}
 }
 
+func TestCanonicalizeURL(t *testing.T) {
+	got := CanonicalizeURL("https://www.facebook.com/marketplace/item/1201486206389924/?ref=browse_tab&referral_code=marketplace_top_picks&referral_story_type=top_picks")
+	if got != "https://www.facebook.com/marketplace/item/1201486206389924/" {
+		t.Fatalf("got %q", got)
+	}
+
+	got = CanonicalizeURL("https://l.facebook.com/l.php?u=https%3A%2F%2Fwww.facebook.com%2Fmarketplace%2Fitem%2F1201486206389924%2F&h=AT")
+	if got != "https://www.facebook.com/marketplace/item/1201486206389924/" {
+		t.Fatalf("unwrap got %q", got)
+	}
+}
+
+func TestParseHTMLMarketplaceOGOnly(t *testing.T) {
+	htmlBody := `
+<title>Top preto — Tops &amp; T-Shirts — Rio de Janeiro | Facebook Marketplace</title>
+<meta property="og:title" content="Top preto" />
+<meta property="og:description" content="Top preto
+
+TAM. Único
+
+Apenas $ 10,00" />
+<meta property="og:url" content="https://www.facebook.com/marketplace/item/1201486206389924/" />
+<meta property="og:image" content="https://scontent.fbcdn.net/v/t39/item.jpg?oh=1" />
+`
+	got := parseHTML(htmlBody, "https://www.facebook.com/marketplace/item/1201486206389924/")
+	if !got.IsMarketplace {
+		t.Fatal("expected marketplace listing from og tags")
+	}
+	if got.Title != "Top preto" {
+		t.Fatalf("title=%q", got.Title)
+	}
+	if got.Price != "$ 10,00" {
+		t.Fatalf("price=%q", got.Price)
+	}
+	if got.Location != "Rio de Janeiro" {
+		t.Fatalf("location=%q", got.Location)
+	}
+	if len(got.MediaDetails) != 1 {
+		t.Fatalf("media=%+v", got.MediaDetails)
+	}
+}
+
+func TestIsLoginWall(t *testing.T) {
+	if !isLoginWall(`<title>Log into Facebook</title><meta property="og:title" content="Facebook" />`) {
+		t.Fatal("expected login wall")
+	}
+	if isLoginWall(`<meta property="og:title" content="Top preto" /><meta property="og:image" content="https://x" />`) {
+		t.Fatal("listing preview should not be a login wall")
+	}
+}
+
 func TestFetchPublicReel(t *testing.T) {
 	if os.Getenv("FB_LIVE") == "" {
 		t.Skip("set FB_LIVE=1 to run a live facebook fetch")
