@@ -110,40 +110,30 @@ func formatAuthorHeader(name, screenName string) string {
 }
 
 func writeFxTweetHeaderAndText(sb *strings.Builder, tweet fxtwitter.Tweet) {
-	header := formatAuthorHeader(tweet.Author.Name, tweet.Author.ScreenName)
-	text := escapeText(tweet.Text)
-	sb.WriteString("<p>")
-	sb.WriteString(header)
-	if text != "" {
-		sb.WriteString("<br/>")
-		sb.WriteString(strings.ReplaceAll(text, "\n", "<br/>"))
-	}
-	sb.WriteString("</p>\n")
+	writeHeaderAndCollapsibleBody(sb, formatAuthorHeader(tweet.Author.Name, tweet.Author.ScreenName), tweet.Text)
 }
 
 func formatFxTweetCaption(tweet fxtwitter.Tweet) string {
-	var caption strings.Builder
-
-	fmt.Fprintf(&caption, "%s:\n%s",
+	caption := formatCaptionWithReadMore(
 		formatAuthorHeader(tweet.Author.Name, tweet.Author.ScreenName),
-		escapeText(tweet.Text),
+		tweet.Text,
 	)
 
 	if tweet.Quote != nil {
 		quotedText := truncateQuotedText(tweet.Quote.Text)
-		fmt.Fprintf(&caption, "\n<blockquote><i>Quoting</i> %s:\n%s</blockquote>",
+		caption += fmt.Sprintf("\n<blockquote><i>Quoting</i> %s:\n%s</blockquote>",
 			formatAuthorHeader(tweet.Quote.Author.Name, tweet.Quote.Author.ScreenName),
 			escapeText(quotedText),
 		)
 	}
 
-	return caption.String()
+	return caption
 }
 
 func formatVxTweetCaption(response vxtwitter.Response) string {
-	return fmt.Sprintf("%s:\n%s",
+	return formatCaptionWithReadMore(
 		formatAuthorHeader(response.UserName, response.UserScreenName),
-		escapeText(response.Text),
+		response.Text,
 	)
 }
 
@@ -246,13 +236,7 @@ func buildFxMediaArticle(tweet fxtwitter.Tweet, medias []resolvedMedia) (string,
 
 func buildVxMediaArticle(response vxtwitter.Response, medias []resolvedMedia) (string, []richMessageMedia) {
 	var htmlBuilder strings.Builder
-	htmlBuilder.WriteString("<p>")
-	htmlBuilder.WriteString(formatAuthorHeader(response.UserName, response.UserScreenName))
-	if response.Text != "" {
-		htmlBuilder.WriteString("<br/>")
-		htmlBuilder.WriteString(strings.ReplaceAll(escapeText(response.Text), "\n", "<br/>"))
-	}
-	htmlBuilder.WriteString("</p>\n")
+	writeHeaderAndCollapsibleBody(&htmlBuilder, formatAuthorHeader(response.UserName, response.UserScreenName), response.Text)
 	mediaList := appendRichMedia(&htmlBuilder, medias, 1)
 	return htmlBuilder.String(), mediaList
 }
@@ -354,7 +338,10 @@ func (t *TelegramChannelImpl) processFxtwitterResponse(update telego.Update, res
 
 	quoteWithMedia := response.Tweet.Quote != nil && (len(mainMedias) > 0 || len(quoteMedias) > 0)
 	gallery := len(medias) > 1 && response.Tweet.Quote == nil
-	tooLong := response.Tweet.IsNoteTweet || exceedsTelegramLimit(caption, len(medias) > 0)
+	tooLong := response.Tweet.IsNoteTweet || exceedsTelegramLimit(caption, len(medias) > 0) || needsReadMore(response.Tweet.Text)
+	if response.Tweet.Quote != nil && needsReadMore(response.Tweet.Quote.Text) {
+		tooLong = true
+	}
 
 	// Quotes with media, galleries, and long/note tweets use sendRichMessage
 	// (regular captions cap at 1024 chars; text messages at 4096).
@@ -419,7 +406,7 @@ func (t *TelegramChannelImpl) processVxtwitterResponse(update telego.Update, res
 	}
 
 	// Galleries and long tweets use one rich message; normal posts use regular sends.
-	if len(medias) > 1 || exceedsTelegramLimit(caption, len(medias) > 0) {
+	if len(medias) > 1 || exceedsTelegramLimit(caption, len(medias) > 0) || needsReadMore(response.Text) {
 		htmlBody, richMedia := buildVxMediaArticle(response, medias)
 		err := t.sendRichMessage(update.Message.Chat.ID, update.Message.MessageID, htmlBody, richMedia, keyboard)
 		if err == nil {

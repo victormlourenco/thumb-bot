@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"unicode/utf8"
 
 	"github.com/mymmrac/telego"
@@ -14,6 +15,10 @@ import (
 const (
 	telegramCaptionLimit = 1024
 	telegramMessageLimit = 4096
+	previewMaxRunes      = 280
+	previewMaxLines      = 4
+	collapseMinRestRunes = 80
+	readMoreSummary      = "Read more..."
 )
 
 func exceedsTelegramLimit(text string, hasMedia bool) bool {
@@ -22,6 +27,105 @@ func exceedsTelegramLimit(text string, hasMedia bool) bool {
 		limit = telegramCaptionLimit
 	}
 	return utf8.RuneCountInString(text) > limit
+}
+
+func needsReadMore(text string) bool {
+	_, rest := splitReadMore(text)
+	return rest != ""
+}
+
+func splitReadMore(text string) (preview, rest string) {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return "", ""
+	}
+
+	runes := []rune(text)
+	cut := -1
+	lines := 1
+	for i, r := range runes {
+		if r == '\n' {
+			lines++
+			if lines > previewMaxLines {
+				cut = i
+				break
+			}
+		}
+		if i+1 >= previewMaxRunes && cut < 0 {
+			cut = breakAtWord(runes, i+1)
+			break
+		}
+	}
+
+	if cut < 0 || cut >= len(runes) {
+		return text, ""
+	}
+
+	preview = strings.TrimRight(string(runes[:cut]), " \t\n")
+	rest = strings.TrimLeft(string(runes[cut:]), " \t\n")
+	if rest == "" || utf8.RuneCountInString(rest) < collapseMinRestRunes {
+		return text, ""
+	}
+	return preview, rest
+}
+
+func breakAtWord(runes []rune, at int) int {
+	if at >= len(runes) {
+		return -1
+	}
+	for i := at; i > 0 && at-i < 40; i-- {
+		switch runes[i-1] {
+		case ' ', '\t', '\n':
+			return i - 1
+		}
+	}
+	return at
+}
+
+func richPlainHTML(text string) string {
+	return strings.ReplaceAll(escapeText(text), "\n", "<br/>")
+}
+
+func writeReadMoreDetails(sb *strings.Builder, rest string) {
+	sb.WriteString("<details><summary>")
+	sb.WriteString(readMoreSummary)
+	sb.WriteString("</summary>\n<p>")
+	sb.WriteString(richPlainHTML(rest))
+	sb.WriteString("</p>\n</details>\n")
+}
+
+func writeHeaderAndCollapsibleBody(sb *strings.Builder, headerHTML, body string) {
+	preview, rest := splitReadMore(body)
+
+	sb.WriteString("<p>")
+	sb.WriteString(headerHTML)
+	if preview != "" {
+		sb.WriteString("<br/>")
+		sb.WriteString(richPlainHTML(preview))
+	}
+	sb.WriteString("</p>\n")
+
+	if rest != "" {
+		writeReadMoreDetails(sb, rest)
+	}
+}
+
+func formatCaptionWithReadMore(header, body string) string {
+	if body == "" {
+		return header
+	}
+	preview, rest := splitReadMore(body)
+	var caption strings.Builder
+	caption.WriteString(header)
+	caption.WriteString(":\n")
+	caption.WriteString(escapeText(preview))
+	if rest != "" {
+		caption.WriteString("\n<blockquote expandable>")
+		caption.WriteString(escapeText(rest))
+		caption.WriteString("</blockquote>")
+	}
+	return caption.String()
 }
 
 type richMessageMedia struct {
