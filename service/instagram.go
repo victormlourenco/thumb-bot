@@ -33,10 +33,7 @@ func formatInstagramCaption(response instagram.InstagramResponse) string {
 		escapeText(username),
 	)
 
-	if response.PostInfo.Caption == "" {
-		return header
-	}
-	return fmt.Sprintf("%s:\n%s", header, escapeText(response.PostInfo.Caption))
+	return formatCaptionWithReadMore(header, response.PostInfo.Caption)
 }
 
 func writeInstagramHeaderAndText(sb *strings.Builder, response instagram.InstagramResponse) {
@@ -52,15 +49,7 @@ func writeInstagramHeaderAndText(sb *strings.Builder, response instagram.Instagr
 		escapeText(name),
 		escapeText(username),
 	)
-	caption := escapeText(response.PostInfo.Caption)
-
-	sb.WriteString("<p>")
-	sb.WriteString(header)
-	if caption != "" {
-		sb.WriteString("<br/>")
-		sb.WriteString(strings.ReplaceAll(caption, "\n", "<br/>"))
-	}
-	sb.WriteString("</p>\n")
+	writeHeaderAndCollapsibleBody(sb, header, response.PostInfo.Caption)
 }
 
 func buildInstagramRichArticle(response instagram.InstagramResponse, medias []resolvedMedia) (string, []richMessageMedia) {
@@ -191,7 +180,7 @@ func (t *TelegramChannelImpl) processInstagramMedia(update telego.Update) error 
 		caption := formatInstagramCaption(response)
 
 		// Carousels and long captions use one rich message (captions cap at 1024 chars).
-		if len(medias) > 1 || exceedsTelegramLimit(caption, true) {
+		if len(medias) > 1 || exceedsTelegramLimit(caption, true) || needsReadMore(response.PostInfo.Caption) {
 			keyboard := openInstagramKeyboard(postURL)
 			htmlBody, richMedia := buildInstagramRichArticle(response, medias)
 			if err := t.sendRichMessage(update.Message.Chat.ID, update.Message.MessageID, htmlBody, richMedia, keyboard); err == nil {
